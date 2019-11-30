@@ -1,6 +1,13 @@
 import Vue from 'vue'
 import VueRouter from 'vue-router'
 import Home from '../views/Home.vue'
+import DomainList from "../views/Console/DomainList/index";
+import {HTTP, logout} from "../utils";
+import Login from "../views/Login";
+import store from '../store';
+import AltDomainList from "../views/AltDomainList";
+import AltDomain from "../views/Domain/AltDomain";
+import Domain from "../views/Domain";
 
 Vue.use(VueRouter)
 
@@ -79,6 +86,39 @@ const routes = [
     name: 'about',
     component: () => import('../views/About.vue')
   },
+  {
+    path: '/login',
+    name: 'login',
+    component: Login,
+  },
+
+  /* "manual" table implementation */
+  {
+    path: '/domains',
+    name: 'domains',
+    component: DomainList,
+    meta: {guest: false},
+  },
+  {
+    path: '/domains/:name',
+    name: 'Domain',
+    component: Domain,
+    meta: {guest: false},
+  },
+
+  /* generic table implementation */
+  {
+    path: '/domainsalt',
+    name: 'domainsalt',
+    component: AltDomainList,
+    meta: {guest: false},
+  },
+  {
+    path: '/domainsalt/:name',
+    name: 'AltDomain',
+    component: AltDomain,
+    meta: {guest: false},
+  },
 ]
 
 const router = new VueRouter({
@@ -93,5 +133,45 @@ const router = new VueRouter({
   },
   routes
 })
+
+router.beforeEach((to, from, next) => {
+  // see if there are credentials in the session store that we don't know of
+  let recovered = false;
+  if (sessionStorage.getItem('token') && !store.state.authenticated){
+    HTTP.defaults.headers.common['Authorization'] = 'Token ' + sessionStorage.getItem('token');
+    store.commit('login', sessionStorage.getItem('token'));
+    recovered = true
+  }
+
+  if (to.matched.some(record => 'guest' in record.meta && record.meta.guest === false)) {
+    // this route requires auth, check if logged in
+    // if not, redirect to login page.
+    if (!store.state.authenticated) {
+      next({
+        name: 'login',
+        query: { redirect: to.fullPath }
+      })
+    } else {
+      next()
+    }
+  } else {
+    if (store.state.authenticated) {
+      // Log in state was present, but not needed for the current page
+      if (recovered) {
+        // user restored a previous session
+        // redirect her to the home page for authorized users
+        next({
+          name: 'DomainList'
+        })
+      } else {
+        // user navigated to a page that doesn't require auth
+        // from within the current session (without session restore)
+        // to bias on the safe side we log out
+        logout()
+      }
+    }
+    next() // make sure to always call next()!
+  }
+});
 
 export default router
