@@ -57,6 +57,7 @@ export default {
         value: 'ttl',
         readonly: false,
         datatype: 'GenericText', // TODO TTL is not a String
+        fieldProps: () => ({ type: 'number' }),
         searchable: true,
       },
     },
@@ -68,7 +69,7 @@ export default {
       delete: 'domains/::{name}/rrsets/:{subname}.../:{type}/',
     },
     defaultObject: {
-      type: 'A', subname: '', records: [''], ttl: 60 * 60 * 24 * 7,
+      type: 'A', subname: '', records: [''], ttl: 3600,
     },
   }),
 };

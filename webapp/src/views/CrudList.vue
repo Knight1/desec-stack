@@ -11,7 +11,6 @@
       {{ errors[errors.length - 1] }}
       <v-btn
         dark
-        flat
         @click="snackbar = false"
       >
         Close
@@ -155,7 +154,6 @@
                 v-for="action in actions"
                 :key="action.key"
                 color="grey"
-                flat
                 icon
                 @click.stop="action.go(props.item)"
               >
@@ -165,7 +163,6 @@
                 v-if="destroyable"
                 color="grey"
                 class="hover-red"
-                flat
                 icon
                 @click.stop="destroyAsk(props.item)"
               >

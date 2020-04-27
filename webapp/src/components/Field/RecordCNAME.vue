@@ -14,7 +14,7 @@ export default {
       trailingDot: 'Hostname must end with a dot.',
     },
     fields: [
-      { validations: { hostname, trailingDot } },
+      { label: 'Target hostname', validations: { hostname, trailingDot } },
     ],
   }),
 };

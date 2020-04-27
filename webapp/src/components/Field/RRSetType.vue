@@ -1,5 +1,6 @@
 <template>
   <v-combobox
+    :label="label"
     :value="value"
     :items="types"
     @input="input($event)"
@@ -10,6 +11,10 @@
 export default {
   name: 'RRSetType',
   props: {
+    label: {
+      type: String,
+      required: false,
+    },
     value: {
       type: String,
       required: true,

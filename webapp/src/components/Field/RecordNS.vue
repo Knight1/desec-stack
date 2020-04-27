@@ -6,7 +6,7 @@ export default {
   extends: Record,
   data: () => ({
     fields: [
-      { name: 'value', value: '', validations: {} },
+      { label: 'Hostname', value: '', validations: {} },
     ],
   }),
 };

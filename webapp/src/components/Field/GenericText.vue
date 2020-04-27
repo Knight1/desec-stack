@@ -1,7 +1,9 @@
 <template>
   <v-text-field
+    :label="label"
     :value="value"
-    placeholder="(empty)"
+    :type="type || ''"
+    placeholder="(optional)"
     @input="input($event)"
   />
 </template>
@@ -10,9 +12,17 @@
 export default {
   name: 'GenericText',
   props: {
-    value: {
+    label: {
       type: String,
+      required: false,
+    },
+    value: {
+      type: [String, Number],
       required: true,
+    },
+    type: {
+      type: String,
+      required: false,
     },
   },
   methods: {

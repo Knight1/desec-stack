@@ -54,7 +54,7 @@ export default {
       required: ' ',
     },
     fields: [
-      { validations: {} },
+      { label: 'Content', validations: {} },
     ],
     value: '',
   }),

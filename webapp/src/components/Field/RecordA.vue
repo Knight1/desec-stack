@@ -10,7 +10,7 @@ export default {
       ipAddress: 'This field must contain an IPv4 address.',
     },
     fields: [
-      { validations: { ipAddress } },
+      { label: 'IPv4 address', validations: { ipAddress } },
     ],
   }),
 };

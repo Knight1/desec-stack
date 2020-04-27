@@ -54,7 +54,7 @@
         class="elevation-1"
       > <!-- TODO our pagination implementation was using outdated API and has thus been removed -->
         <template
-          slot="headers"
+          slot="header"
           slot-scope="props"
         >
           <tr>
@@ -84,7 +84,7 @@
             <td>
               <v-text-field
                 v-model="subname"
-                placeholder="(empty)"
+                placeholder="(optional)"
               />
             </td>
             <td>
@@ -130,7 +130,7 @@
           </tr>
         </template>
         <template
-          slot="items"
+          slot="item"
           slot-scope="props"
         >
           <rrset

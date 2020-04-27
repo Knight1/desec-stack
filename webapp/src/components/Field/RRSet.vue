@@ -1,6 +1,5 @@
 <template>
   <div>
-    <code>{{ value }}</code>
     <component
       :is="getRecordComponentName(type)"
       v-for="(record, index) in value"
@@ -9,6 +8,7 @@
       :clearable="value.length > 1"
       @update:content="$set(value, index, $event)"
     />
+    <code style="white-space: normal">{{ value }}</code>
   </div>
 </template>
 
