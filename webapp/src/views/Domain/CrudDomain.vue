@@ -2,7 +2,7 @@
 import CrudList from '@/views/CrudList';
 
 export default {
-  name: 'AltDomain',
+  name: 'CrudDomain',
   extends: CrudList,
   data: () => ({
     createable: true,

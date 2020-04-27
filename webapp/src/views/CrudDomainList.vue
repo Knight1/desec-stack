@@ -2,7 +2,7 @@
 import CrudList from './CrudList';
 
 export default {
-  name: 'AltDomainList',
+  name: 'CrudDomainList',
   extends: CrudList,
   data: () => ({
     createable: true,
@@ -54,7 +54,7 @@ export default {
     },
     defaultObject: { name: '' },
     postcreate: d => (alert(`postcreate ${d.name}`)),
-    rowclick(domain) { this.$router.push({ name: 'AltDomain', params: { name: domain.name } }); },
+    rowclick(domain) { this.$router.push({ name: 'CrudDomain', params: { name: domain.name } }); },
   }),
 };
 </script>

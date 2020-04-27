@@ -5,8 +5,8 @@ import DomainList from "../views/Console/DomainList/index";
 import {HTTP, logout} from "../utils";
 import Login from "../views/Login";
 import store from '../store';
-import AltDomainList from "../views/AltDomainList";
-import AltDomain from "../views/Domain/AltDomain";
+import CrudDomainList from "../views/CrudDomainList";
+import CrudDomain from "../views/Domain/CrudDomain";
 import Domain from "../views/Domain";
 
 Vue.use(VueRouter)
@@ -94,13 +94,13 @@ const routes = [
 
   /* "manual" table implementation */
   {
-    path: '/domains',
-    name: 'domains',
+    path: '/domains-homebrew',
+    name: 'domains-homebrew',
     component: DomainList,
     meta: {guest: false},
   },
   {
-    path: '/domains/:name',
+    path: '/domains-homebrew/:name',
     name: 'Domain',
     component: Domain,
     meta: {guest: false},
@@ -108,15 +108,15 @@ const routes = [
 
   /* generic table implementation */
   {
-    path: '/domainsalt',
-    name: 'domainsalt',
-    component: AltDomainList,
+    path: '/domains-crud',
+    name: 'domains-crud',
+    component: CrudDomainList,
     meta: {guest: false},
   },
   {
-    path: '/domainsalt/:name',
-    name: 'AltDomain',
-    component: AltDomain,
+    path: '/domain-crud/:name',
+    name: 'CrudDomain',
+    component: CrudDomain,
     meta: {guest: false},
   },
 ]

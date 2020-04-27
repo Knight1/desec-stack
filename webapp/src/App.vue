@@ -49,7 +49,20 @@
       <v-btn class="mx-4 mr-0" color="primary" depressed :to="{name: 'login'}" v-if="!$store.state.authenticated">Log In</v-btn>
       <v-btn class="mx-4 mr-0" color="primary" depressed outlined @click="logout" v-if="$store.state.authenticated">Log Out</v-btn>
       <v-app-bar-nav-icon class="d-md-none" @click.stop="drawer = !drawer" />
+      <template v-slot:extension v-if="$store.state.authenticated">
+        <v-tabs background-color="secondary" fixed-tabs>
+          <v-tab
+            v-for="(item, key) in tabmenu"
+            :key="key"
+            :to="{name: item.name}"
+          >
+            {{ item.text }}
+          </v-tab>
+        </v-tabs>
+      </template>
     </v-app-bar>
+
+
 
     <v-content>
       <router-view/>
@@ -149,17 +162,17 @@ export default {
         'icon': 'mdi-lock-reset',
         'text': 'Reset Account Password',
       },
-      'domains': {
-        'name': 'domains',
-        'icon': 'mdi-list',
-        'text': 'Domains (manual)',
+    },
+    tabmenu: {
+      'domains-homebrew': {
+        'name': 'domains-homebrew',
+        'text': 'Domain Management (homebrew)',
       },
-      'domainsalt': {
-        'name': 'domainsalt',
-        'icon': 'mdi-list',
-        'text': 'Domains (generic)',
+      'domains-crud': {
+        'name': 'domains-crud',
+        'text': 'Domain Management (CRUD)',
       },
-    }
+    },
   }),
   methods: {
     logout() {

@@ -139,7 +139,7 @@ export default {
         if ('redirect' in this.$route.query && this.$route.query.redirect) {
           this.$router.replace(this.$route.query.redirect);
         } else {
-          this.$router.replace({ path: '/domains' });
+          this.$router.replace({ path: '/domains-homebrew' });
         }
       } catch (error) {
         if (error.response) {
