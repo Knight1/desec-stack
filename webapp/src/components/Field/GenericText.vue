@@ -1,6 +1,7 @@
 <template>
   <v-text-field
     :label="label"
+    :disabled="readonly"
     :value="value"
     :type="type || ''"
     placeholder="(optional)"
@@ -14,6 +15,10 @@ export default {
   props: {
     label: {
       type: String,
+      required: false,
+    },
+    readonly: {
+      type: Boolean,
       required: false,
     },
     value: {

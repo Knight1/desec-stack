@@ -172,6 +172,10 @@ export default {
         'name': 'domains-crud',
         'text': 'Domain Management (CRUD)',
       },
+      'tokens': {
+        'name': 'tokens',
+        'text': 'Token Management',
+      },
     },
   }),
   methods: {

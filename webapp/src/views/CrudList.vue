@@ -114,6 +114,10 @@
     </v-toolbar>
 
     <!-- The Actual Table -->
+    <v-banner class="primary lighten-4" icon="mdi-information">
+      Any API Token can be used to perform any DNS operation on any domain in this account.
+      Token scoping is on our roadmap.
+    </v-banner>
     <v-data-table
       :headers="headers"
       :items="rows"
@@ -135,6 +139,7 @@
           >
             <component
               :is="getDatatype(c.datatype, props.item)"
+              :readonly="c.readonly"
               v-model="props.item[c.value]"
               v-bind="c.fieldProps ? c.fieldProps(props.item) : {}"
             />
@@ -339,8 +344,8 @@ export default {
     },
     writeableColumns() {
       const filter = function (obj, predicate) {
-        const result = {}; let
-          key;
+        const result = {};
+        let key;
         for (key in obj) {
           if (obj.hasOwnProperty(key) && !predicate(obj[key])) {
             result[key] = obj[key];

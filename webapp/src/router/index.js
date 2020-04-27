@@ -8,6 +8,7 @@ import store from '../store';
 import CrudDomainList from "../views/CrudDomainList";
 import CrudDomain from "../views/Domain/CrudDomain";
 import Domain from "../views/Domain";
+import TokenList from "../views/TokenList";
 
 Vue.use(VueRouter)
 
@@ -90,6 +91,12 @@ const routes = [
     path: '/login',
     name: 'login',
     component: Login,
+  },
+  {
+    path: '/tokens',
+    name: 'tokens',
+    component: TokenList,
+    meta: {guest: false},
   },
 
   /* "manual" table implementation */
