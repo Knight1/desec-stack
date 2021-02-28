@@ -1,4 +1,4 @@
-import random
+import secrets
 import socket
 
 from django.conf import settings
@@ -6,8 +6,7 @@ from django.db.models.signals import post_save, post_delete
 from django.db.transaction import atomic
 from django.utils import timezone
 
-from desecapi import metrics
-from desecapi.exceptions import PDNSValidationError
+from desecapi import metrics, replication
 from desecapi.models import RRset, RR, Domain
 from desecapi.pdns import _pdns_post, NSLORD, NSMASTER, _pdns_delete, _pdns_patch, _pdns_put, pdns_id, \
     construct_catalog_rrset
@@ -85,7 +84,7 @@ class PDNSChangeTracker:
             return True
 
         def pdns_do(self):
-            salt = '%016x' % random.randrange(16 ** 16)
+            salt = secrets.token_hex(nbytes=8)
             _pdns_post(
                 NSLORD, '/zones?rrsets=false',
                 {
@@ -93,7 +92,21 @@ class PDNSChangeTracker:
                     'kind': 'MASTER',
                     'dnssec': True,
                     'nsec3param': '1 0 127 %s' % salt,
-                    'nameservers': settings.DEFAULT_NS
+                    'nameservers': settings.DEFAULT_NS,
+                    'rrsets': [{
+                        'name': self.domain_name_normalized,
+                        'type': 'SOA',
+                        # SOA RRset TTL: 300 (used as TTL for negative replies including NSEC3 records)
+                        'ttl': 300,
+                        'records': [{
+                            # SOA refresh: 1 day (only needed for nslord --> nsmaster replication after RRSIG rotation)
+                            # SOA retry = refresh
+                            # SOA expire: 4 weeks (all signatures will have expired anyways)
+                            # SOA minimum: 3600 (for CDS, CDNSKEY, DNSKEY, NSEC3PARAM)
+                            'content': 'get.desec.io. get.desec.io. 1 86400 86400 2419200 3600',
+                            'disabled': False
+                        }],
+                    }],
                 }
             )
 
@@ -242,22 +255,23 @@ class PDNSChangeTracker:
         # TODO introduce two phase commit protocol
         changes = self._compute_changes()
         axfr_required = set()
+        replication_required = set()
         for change in changes:
             try:
                 change.pdns_do()
                 change.api_do()
+                replication_required.add(change.domain_name)
                 if change.axfr_required:
                     axfr_required.add(change.domain_name)
-            except PDNSValidationError as e:
-                self.transaction.__exit__(type(e), e, e.__traceback__)
-                raise e
             except Exception as e:
                 self.transaction.__exit__(type(e), e, e.__traceback__)
-                exc = ValueError(f'For changes {list(map(str, changes))}, {type(e)} occured when applying {change}')
+                exc = ValueError(f'For changes {list(map(str, changes))}, {type(e)} occurred during {change}: {str(e)}')
                 raise exc from e
 
         self.transaction.__exit__(None, None, None)
 
+        for name in replication_required:
+            replication.update.delay(name)
         for name in axfr_required:
             _pdns_put(NSMASTER, '/zones/%s/axfr-retrieve' % pdns_id(name))
         Domain.objects.filter(name__in=axfr_required).update(published=timezone.now())

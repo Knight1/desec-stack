@@ -52,13 +52,16 @@
 
               <v-radio-group
                       v-model="domainType"
-                      hint="Your first domain (you can add more later). – To use dynDNS with your custom domain, please get in touch with us."
+                      :hint="domainType == 'dynDNS'
+                        ? 'Your first domain (you can add more later).'
+                        : 'Your first domain (you can add more later). – To use dynDNS with your custom domain, please get in touch with us.'
+                      "
                       label="Do you want to set up a domain right away?"
                       persistent-hint
                       prepend-icon="mdi-dns"
               >
-                <v-radio :label="`Register a new domain under ${LOCAL_PUBLIC_SUFFIXES[0]} (dynDNS).`" value="dynDNS" tabindex="2"></v-radio>
                 <v-radio label="Configure your own domain (Managed DNS)." value="custom" tabindex="2"></v-radio>
+                <v-radio :label="`Register a new domain under ${LOCAL_PUBLIC_SUFFIXES[0]} (dynDNS).`" value="dynDNS" tabindex="2"></v-radio>
                 <v-radio label="No, I'll add one later through the API." value="none" tabindex="2"></v-radio>
               </v-radio-group>
 
@@ -85,7 +88,7 @@
 
               <v-container class="pa-0">
                 <v-row dense align="center" class="text-center">
-                  <v-col cols="12" sm="">
+                  <v-col cols="8" sm="">
                     <v-text-field
                         v-model="captchaSolution"
                         label="Type CAPTCHA text here"
@@ -100,21 +103,33 @@
                         class="uppercase"
                         ref="captchaField"
                         tabindex="4"
+                        :hint="captcha_kind === 'image' ? 'Can\'t see? Hear an audio CAPTCHA instead.' : 'Trouble hearing? Switch to an image CAPTCHA.'"
                     />
                   </v-col>
-                  <v-col cols="8" sm="auto">
+                  <v-col cols="12" sm="auto">
                     <v-progress-circular
                           indeterminate
                           v-if="captchaWorking"
                     ></v-progress-circular>
                     <img
-                          v-if="captcha && !captchaWorking"
+                          v-if="captcha && !captchaWorking && captcha_kind === 'image'"
                           :src="'data:image/png;base64,'+captcha.challenge"
                           alt="Sign up is also possible by sending an email to our support."
+                    />
+                    <audio controls
+                          v-if="captcha && !captchaWorking && captcha_kind === 'audio'"
                     >
-                  </v-col>
-                  <v-col cols="4" sm="auto">
-                    <v-btn text outlined @click="getCaptcha(true)" :disabled="captchaWorking"><v-icon>mdi-refresh</v-icon></v-btn>
+                      <source :src="'data:audio/wav;base64,'+captcha.challenge" type="audio/wav"/>
+                    </audio>
+                    <br/>
+                    <v-btn-toggle>
+                      <v-btn text outlined @click="getCaptcha(true)" :disabled="captchaWorking"><v-icon>mdi-refresh</v-icon></v-btn>
+                    </v-btn-toggle>
+                    &nbsp;
+                    <v-btn-toggle v-model="captcha_kind">
+                      <v-btn text outlined value="image" aria-label="Switch to Image CAPTCHA" :disabled="captchaWorking"><v-icon>mdi-eye</v-icon></v-btn>
+                      <v-btn text outlined value="audio" aria-label="Switch to Audio CAPTCHA" :disabled="captchaWorking"><v-icon>mdi-ear-hearing</v-icon></v-btn>
+                    </v-btn-toggle>
                   </v-col>
                 </v-row>
               </v-container>
@@ -157,8 +172,9 @@
 
 <script>
   import axios from 'axios';
-  import {LOCAL_PUBLIC_SUFFIXES} from '../env';
   import {domain_pattern, email_pattern} from '../validation';
+
+  const LOCAL_PUBLIC_SUFFIXES = process.env.VUE_APP_LOCAL_PUBLIC_SUFFIXES.split(' ');
 
   const HTTP = axios.create({
     baseURL: '/api/v1/',
@@ -185,6 +201,7 @@
       captchaSolution: '',
       captcha_rules: [v => !!v || 'Please enter the text displayed in the picture so we are (somewhat) convinced you are human'],
       captcha_errors: [],
+      captcha_kind: 'image',
 
       /* terms field */
       terms: false,
@@ -193,8 +210,8 @@
       /* domain field */
       domain: '',
       domainType: null,
-      domain_rules: [v => !!v && !!domain_pattern.test(v) || 'Domain names can only contain letters, numbers, underscores (_), dots (.), and dashes (-), and must end with a top-level domain.'],
-      dyn_domain_rules: [v => !!v && v.indexOf('.') < 0 && !!domain_pattern.test(v + '.' + LOCAL_PUBLIC_SUFFIXES[0]) || 'Your domain name can only contain letters, numbers, underscores (_), and dashes (-).'],
+      domain_rules: [v => !!v && !!domain_pattern.test(v) || 'Domain names can only contain letters, numbers, dots (.), and dashes (-), and must end with a top-level domain.'],
+      dyn_domain_rules: [v => !!v && v.indexOf('.') < 0 && !!domain_pattern.test(v + '.' + LOCAL_PUBLIC_SUFFIXES[0]) || 'Your domain name can only contain letters, numbers, and dashes (-).'],
       domain_errors: [],
     }),
     async mounted() {
@@ -205,7 +222,7 @@
       this.initialFocus();
     },
     created() {
-      this.domainType = this.$route.query.domainType || 'dynDNS';
+      this.domainType = this.$route.query.domainType || 'custom';
     },
     methods: {
       async open_route(route) {
@@ -216,7 +233,7 @@
         this.captchaWorking = true;
         this.captchaSolution = "";
         try {
-          this.captcha = (await HTTP.post('captcha/')).data;
+          this.captcha = (await HTTP.post('captcha/', {kind: this.captcha_kind})).data;
           if(focus) {
             this.$refs.captchaField.focus()
           }
@@ -242,7 +259,7 @@
         }
         try {
           await HTTP.post('auth/', {
-            email: this.email.toLowerCase(),
+            email: this.email,
             password: null,
             captcha: {
               id: this.captcha.id,
@@ -281,7 +298,7 @@
               }
             } else {
               // 5xx
-              this.errors = ['Something went wrong at the server, but we currently do not know why. The customer support was already notified.'];
+              this.errors = ['Something went wrong at the server, but we currently do not know why. The support was already notified.'];
             }
           } else if (error.request) {
             this.errors = ['Cannot contact our servers. Are you offline?'];
@@ -300,6 +317,11 @@
           }
           this.$refs.domainField.validate();
         })
+      },
+      captcha_kind: function (oldKind, newKind) {
+        if (oldKind !== newKind) {
+          this.getCaptcha();
+        }
       },
     },
   };

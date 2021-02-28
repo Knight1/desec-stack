@@ -12,7 +12,9 @@ https://docs.djangoproject.com/en/1.7/ref/settings/
 import os
 from datetime import timedelta
 
+from celery.schedules import crontab
 from django.conf.global_settings import PASSWORD_HASHERS as DEFAULT_PASSWORD_HASHERS
+from kombu import Queue, Exchange
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
@@ -62,21 +64,12 @@ WSGI_APPLICATION = 'desecapi.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django_prometheus.db.backends.mysql',
+        'ENGINE': 'django_prometheus.db.backends.postgresql',
         'NAME': 'desec',
         'USER': 'desec',
         'PASSWORD': os.environ['DESECSTACK_DBAPI_PASSWORD_desec'],
         'HOST': 'dbapi',
-        'OPTIONS': {
-            'charset': 'utf8mb4',
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
-        'TEST': {
-            'CHARSET': 'utf8mb4',
-            'COLLATION': 'utf8mb4_bin',
-        },
     },
-
 }
 
 CACHES = {
@@ -112,13 +105,13 @@ REST_FRAMEWORK = {
         'desecapi.throttling.ScopedRatesThrottle',
         'rest_framework.throttling.UserRateThrottle',
     ],
-    'DEFAULT_THROTTLE_RATES': {
+    'DEFAULT_THROTTLE_RATES': {  # When changing rate limits, make sure to keep docs/rate-limits.rst consistent
         # ScopedRatesThrottle
         'account_management_active': ['3/min'],  # things with side effect, e.g. sending mail or zone creation on signup
         'account_management_passive': ['10/min'],  # things like GET'ing v/* or auth/* URLs, or creating/deleting tokens
         'dyndns': ['1/min'],  # dynDNS updates; anything above 1/min is a client misconfiguration
-        'dns_api_read': ['5/s', '50/min'],  # DNS API requests that do not involve pdns
-        'dns_api_write': ['3/s', '50/min', '200/h'],  # DNS API requests that do involve pdns
+        'dns_api_read': ['10/s', '50/min'],  # DNS API requests that do not involve pdns
+        'dns_api_write': ['6/s', '50/min', '200/h'],  # DNS API requests that do involve pdns
         # UserRateThrottle
         'user': '1000/d',  # hard limit on requests by a) an authenticated user, b) an unauthenticated IP address
     },
@@ -130,7 +123,7 @@ PASSWORD_HASHERS = DEFAULT_PASSWORD_HASHERS + [PASSWORD_HASHER_TOKEN]
 
 # CORS
 # No need to add Authorization to CORS_ALLOW_HEADERS (included by default)
-CORS_ORIGIN_ALLOW_ALL = True
+CORS_ALLOW_ALL_ORIGINS = True
 
 TEMPLATES = [
     {
@@ -176,13 +169,38 @@ NSMASTER_PDNS_API_TOKEN = os.environ['DESECSTACK_NSMASTER_APIKEY']
 CATALOG_ZONE = 'catalog.internal'
 
 # Celery
+# see https://docs.celeryproject.org/en/stable/history/whatsnew-4.0.html#latentcall-django-admonition
 CELERY_BROKER_URL = 'amqp://rabbitmq'
 CELERY_EMAIL_MESSAGE_EXTRA_ATTRIBUTES = []  # required because djcelery_email.utils accesses it
-CELERY_TASK_TIME_LIMIT = 30
+CELERY_TASK_TIME_LIMIT = 300  # as zones become larger, AXFR takes longer, this needs to be increased
 TASK_CONFIG = {  # The first entry is the default queue
     'email_slow_lane': {'rate_limit': '3/m'},
     'email_fast_lane': {'rate_limit': '1/s'},
+    'email_immediate_lane': {'rate_limit': None},
 }
+CELERY_TIMEZONE = 'UTC'  # timezone for task schedule below
+CELERY_BEAT_SCHEDULE = {
+    'rotate_signatures': {
+        'task': 'desecapi.replication.update_all',
+        'schedule': crontab(minute=0, hour=0, day_of_week='thursday'),
+        'options': {'priority': 5},  # priority must be higher than rotation jobs for individual domains
+    },
+    'remove_history': {
+        'task': 'desecapi.replication.remove_history',
+        'schedule': crontab(minute=42, hour='*/3'),
+        'options': {'priority': 5},
+    },
+}
+CELERY_TASK_QUEUES = [
+    Queue(
+        'replication',
+        Exchange('replication'),
+        routing_key='replication',
+        queue_arguments={'x-max-priority': 10},  # make the replication queue a priority-queue
+    ),
+    # Other queues are created automatically
+]
+CELERY_BEAT_MAX_LOOP_INTERVAL = 15  # Low value important for running e2e2 tests in reasonable time
 
 # pdns accepts request payloads of this size.
 # This will hopefully soon be configurable: https://github.com/PowerDNS/pdns/pull/7550
@@ -203,7 +221,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 MINIMUM_TTL_DEFAULT = int(os.environ['DESECSTACK_MINIMUM_TTL_DEFAULT'])
 AUTH_USER_MODEL = 'desecapi.User'
-LIMIT_USER_DOMAIN_COUNT_DEFAULT = 5
+LIMIT_USER_DOMAIN_COUNT_DEFAULT = 15
 USER_ACTIVATION_REQUIRED = True
 VALIDITY_PERIOD_VERIFICATION_SIGNATURE = timedelta(hours=int(os.environ.get('DESECSTACK_API_AUTHACTION_VALIDITY', '0')))
 
@@ -224,7 +242,7 @@ except ImportError:
 else:
     import prometheus_client
     prometheus_client.values.ValueClass = prometheus_client.values.MultiProcessValue(
-        _pidFunc=uwsgi.worker_id)
+        process_identifier=uwsgi.worker_id)
 
 if DEBUG and not EMAIL_HOST:
     EMAIL_BACKEND = 'django.core.mail.backends.dummy.EmailBackend'

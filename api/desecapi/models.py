@@ -1,36 +1,46 @@
 from __future__ import annotations
 
+import binascii
+import ipaddress
 import json
 import logging
+import re
 import secrets
 import string
 import time
 import uuid
-from base64 import urlsafe_b64encode
 from datetime import timedelta
+from functools import cached_property
 from hashlib import sha256
-from os import urandom
 
+import dns
 import psl_dns
 import rest_framework.authtoken.models
 from django.conf import settings
 from django.contrib.auth.hashers import make_password
-from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, AnonymousUser
+from django.contrib.auth.models import AbstractBaseUser, AnonymousUser, BaseUserManager
+from django.contrib.postgres.constraints import ExclusionConstraint
+from django.contrib.postgres.fields import ArrayField, CIEmailField, RangeOperators
 from django.core.exceptions import ValidationError
 from django.core.mail import EmailMessage, get_connection
-from django.core.validators import RegexValidator
+from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import Manager, Q
+from django.db.models import CharField, F, Manager, Q, Value
+from django.db.models.expressions import RawSQL
+from django.db.models.functions import Concat, Length
 from django.template.loader import get_template
 from django.utils import timezone
 from django_prometheus.models import ExportModelOperationsMixin
+from dns import rdataclass, rdatatype
 from dns.exception import Timeout
+from dns.rdtypes import ANY, IN
 from dns.resolver import NoNameservers
+from netfields import CidrAddressField, NetManager
 from rest_framework.exceptions import APIException
 
 from desecapi import metrics
 from desecapi import pdns
-
+from desecapi.dns import CDS, DLV, DS, LongQuotedTXT
 
 logger = logging.getLogger(__name__)
 psl = psl_dns.PSL(resolver=settings.PSL_RESOLVER, timeout=.5)
@@ -77,16 +87,20 @@ class MyUserManager(BaseUserManager):
 
 
 class User(ExportModelOperationsMixin('User'), AbstractBaseUser):
+    @staticmethod
+    def _limit_domains_default():
+        return settings.LIMIT_USER_DOMAIN_COUNT_DEFAULT
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    email = models.EmailField(
+    email = CIEmailField(
         verbose_name='email address',
-        max_length=191,
         unique=True,
     )
     is_active = models.BooleanField(default=True)
     is_admin = models.BooleanField(default=False)
     created = models.DateTimeField(auto_now_add=True)
-    limit_domains = models.IntegerField(default=settings.LIMIT_USER_DOMAIN_COUNT_DEFAULT, null=True, blank=True)
+    limit_domains = models.IntegerField(default=_limit_domains_default.__func__, null=True, blank=True)
+    needs_captcha = models.BooleanField(default=True)
 
     objects = MyUserManager()
 
@@ -122,6 +136,7 @@ class User(ExportModelOperationsMixin('User'), AbstractBaseUser):
 
     def activate(self):
         self.is_active = True
+        self.needs_captcha = False
         self.save()
 
     def change_email(self, email):
@@ -137,9 +152,16 @@ class User(ExportModelOperationsMixin('User'), AbstractBaseUser):
         self.save()
         self.send_email('password-change-confirmation')
 
+    def delete(self):
+        pk = self.pk
+        ret = super().delete()
+        logger.warning(f'User {pk} deleted')
+        return ret
+
     def send_email(self, reason, context=None, recipient=None):
         fast_lane = 'email_fast_lane'
         slow_lane = 'email_slow_lane'
+        immediate_lane = 'email_immediate_lane'
         lanes = {
             'activate': slow_lane,
             'activate-with-domain': slow_lane,
@@ -149,18 +171,17 @@ class User(ExportModelOperationsMixin('User'), AbstractBaseUser):
             'reset-password': fast_lane,
             'delete-user': fast_lane,
             'domain-dyndns': fast_lane,
+            'renew-domain': immediate_lane,
         }
         if reason not in lanes:
             raise ValueError(f'Cannot send email to user {self.pk} without a good reason: {reason}')
 
         context = context or {}
-        context.setdefault('link_expiration_hours',
-                           settings.VALIDITY_PERIOD_VERIFICATION_SIGNATURE // timedelta(hours=1))
         content = get_template(f'emails/{reason}/content.txt').render(context)
         content += f'\nSupport Reference: user_id = {self.pk}\n'
         footer = get_template('emails/footer.txt').render()
 
-        logger.warning(f'Queuing email for user account {self.pk} (reason: {reason})')
+        logger.warning(f'Queuing email for user account {self.pk} (reason: {reason}, lane: {lanes[reason]})')
         num_queued = EmailMessage(
             subject=get_template(f'emails/{reason}/subject.txt').render(context).strip(),
             body=content + footer,
@@ -172,72 +193,73 @@ class User(ExportModelOperationsMixin('User'), AbstractBaseUser):
         return num_queued
 
 
-class Token(ExportModelOperationsMixin('Token'), rest_framework.authtoken.models.Token):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    key = models.CharField("Key", max_length=128, db_index=True, unique=True)
-    user = models.ForeignKey(
-        User, related_name='auth_tokens',
-        on_delete=models.CASCADE, verbose_name="User"
-    )
-    name = models.CharField("Name", max_length=64, default="")
-    plain = None
-
-    def generate_key(self):
-        self.plain = urlsafe_b64encode(urandom(21)).decode()
-        self.key = Token.make_hash(self.plain)
-        return self.key
-
-    @staticmethod
-    def make_hash(plain):
-        return make_password(plain, salt='static', hasher='pbkdf2_sha256_iter1')
-
-
 validate_domain_name = [
     validate_lower,
     RegexValidator(
-        regex=r'^([a-z0-9_-]{1,63}\.)*[a-z]{1,63}$',
-        message='Invalid value (not a DNS name).',
-        code='invalid_domain_name'
+        regex=r'^(([a-z0-9_-]{1,63})\.)*[a-z0-9-]{1,63}$',
+        message='Domain names must be labels separated by dots. Labels may consist of up to 63 letters, digits, '
+                'hyphens, and underscores. The last label may not contain an underscore.',
+        code='invalid_domain_name',
+        flags=re.IGNORECASE
     )
 ]
 
 
-def get_minimum_ttl_default():
-    return settings.MINIMUM_TTL_DEFAULT
+class DomainManager(Manager):
+    def filter_qname(self, qname: str, **kwargs) -> models.query.QuerySet:
+        try:
+            Domain._meta.get_field('name').run_validators(qname)
+        except ValidationError:
+            raise ValueError
+        return self.annotate(
+            dotted_name=Concat(Value('.'), 'name', output_field=CharField()),
+            dotted_qname=Value(f'.{qname}', output_field=CharField()),
+            name_length=Length('name'),
+        ).filter(dotted_qname__endswith=F('dotted_name'), **kwargs)
 
 
 class Domain(ExportModelOperationsMixin('Domain'), models.Model):
+    @staticmethod
+    def _minimum_ttl_default():
+        return settings.MINIMUM_TTL_DEFAULT
+
+    class RenewalState(models.IntegerChoices):
+        IMMORTAL = 0
+        FRESH = 1
+        NOTIFIED = 2
+        WARNED = 3
+
     created = models.DateTimeField(auto_now_add=True)
     name = models.CharField(max_length=191,
                             unique=True,
                             validators=validate_domain_name)
     owner = models.ForeignKey(User, on_delete=models.PROTECT, related_name='domains')
     published = models.DateTimeField(null=True, blank=True)
-    minimum_ttl = models.PositiveIntegerField(default=get_minimum_ttl_default)
+    replicated = models.DateTimeField(null=True, blank=True)
+    replication_duration = models.DurationField(null=True, blank=True)
+    minimum_ttl = models.PositiveIntegerField(default=_minimum_ttl_default.__func__)
+    renewal_state = models.IntegerField(choices=RenewalState.choices, default=RenewalState.IMMORTAL)
+    renewal_changed = models.DateTimeField(auto_now_add=True)
+
     _keys = None
+    objects = DomainManager()
 
-    @classmethod
-    def is_registrable(cls, domain_name: str, user: User):
-        """
-        Returns False in any of the following cases:
-        (a) the domain name is under .internal,
-        (b) the domain_name appears on the public suffix list,
-        (c) the domain is descendant to a zone that belongs to any user different from the given one,
-            unless it's parent is a public suffix, either through the Internet PSL or local settings.
-        Otherwise, True is returned.
-        """
-        if domain_name != domain_name.lower():
-            raise ValueError
+    def __init__(self, *args, **kwargs):
+        if isinstance(kwargs.get('owner'), AnonymousUser):
+            kwargs = {**kwargs, 'owner': None}  # make a copy and override
+        # Avoid super().__init__(owner=None, ...) to not mess up *values instantiation in django.db.models.Model.from_db
+        super().__init__(*args, **kwargs)
+        if self.pk is None and kwargs.get('renewal_state') is None and self.is_locally_registrable:
+            self.renewal_state = Domain.RenewalState.FRESH
 
-        if f'.{domain_name}'.endswith('.internal'):
-            return False
-
+    @cached_property
+    def public_suffix(self):
         try:
-            public_suffix = psl.get_public_suffix(domain_name)
-            is_public_suffix = psl.is_public_suffix(domain_name)
+            public_suffix = psl.get_public_suffix(self.name)
+            is_public_suffix = psl.is_public_suffix(self.name)
         except (Timeout, NoNameservers):
-            public_suffix = domain_name.rpartition('.')[2]
-            is_public_suffix = ('.' not in domain_name)  # TLDs are public suffixes
+            public_suffix = self.name.rpartition('.')[2]
+            is_public_suffix = ('.' not in self.name)  # TLDs are public suffixes
         except psl_dns.exceptions.UnsupportedRule as e:
             # It would probably be fine to treat this as a non-public suffix (with the TLD acting as the
             # public suffix and setting both public_suffix and is_public_suffix accordingly).
@@ -246,31 +268,68 @@ class Domain(ExportModelOperationsMixin('Domain'), models.Model):
             # and makes sure admins are notified.
             raise e
 
-        if not is_public_suffix:
-            # Take into account that any of the parent domains could be a local public suffix. To that
-            # end, identify the longest local public suffix that is actually a suffix of domain_name.
-            # Then, override the global PSL result.
-            for local_public_suffix in settings.LOCAL_PUBLIC_SUFFIXES:
-                has_local_public_suffix_parent = ('.' + domain_name).endswith('.' + local_public_suffix)
-                if has_local_public_suffix_parent and len(local_public_suffix) > len(public_suffix):
-                    public_suffix = local_public_suffix
-                    is_public_suffix = (public_suffix == domain_name)
+        if is_public_suffix:
+            return public_suffix
 
-        if is_public_suffix and domain_name not in settings.LOCAL_PUBLIC_SUFFIXES:
-            return False
+        # Take into account that any of the parent domains could be a local public suffix. To that
+        # end, identify the longest local public suffix that is actually a suffix of domain_name.
+        for local_public_suffix in settings.LOCAL_PUBLIC_SUFFIXES:
+            has_local_public_suffix_parent = ('.' + self.name).endswith('.' + local_public_suffix)
+            if has_local_public_suffix_parent and len(local_public_suffix) > len(public_suffix):
+                public_suffix = local_public_suffix
 
+        return public_suffix
+
+    def is_covered_by_foreign_zone(self):
         # Generate a list of all domains connecting this one and its public suffix.
         # If another user owns a zone with one of these names, then the requested
         # domain is unavailable because it is part of the other user's zone.
-        private_components = domain_name.rsplit(public_suffix, 1)[0].rstrip('.')
+        private_components = self.name.rsplit(self.public_suffix, 1)[0].rstrip('.')
         private_components = private_components.split('.') if private_components else []
-        private_components += [public_suffix]
-        private_domains = ['.'.join(private_components[i:]) for i in range(0, len(private_components) - 1)]
-        assert is_public_suffix or domain_name == private_domains[0]
+        private_domains = ['.'.join(private_components[i:]) for i in range(0, len(private_components))]
+        private_domains = [f'{private_domain}.{self.public_suffix}' for private_domain in private_domains]
+        assert self.name == next(iter(private_domains), self.public_suffix)
 
-        # Deny registration for non-local public suffixes and for domains covered by other users' zones
-        user = user if not isinstance(user, AnonymousUser) else None
-        return not cls.objects.filter(Q(name__in=private_domains) & ~Q(owner=user)).exists()
+        # Determine whether domain is covered by other users' zones
+        return Domain.objects.filter(Q(name__in=private_domains) & ~Q(owner=self._owner_or_none)).exists()
+
+    def covers_foreign_zone(self):
+        # Note: This is not completely accurate: Ideally, we should only consider zones with identical public suffix.
+        # (If a public suffix lies in between, it's ok.) However, as there could be many descendant zones, the accurate
+        # check is expensive, so currently not implemented (PSL lookups for each of them).
+        return Domain.objects.filter(Q(name__endswith=f'.{self.name}') & ~Q(owner=self._owner_or_none)).exists()
+
+    def is_registrable(self):
+        """
+        Returns False if the domain name is reserved, a public suffix, or covered by / covers another user's domain.
+        Otherwise, True is returned.
+        """
+        self.clean()  # ensure .name is a domain name
+        private_generation = self.name.count('.') - self.public_suffix.count('.')
+        assert private_generation >= 0
+
+        # .internal is reserved
+        if f'.{self.name}'.endswith('.internal'):
+            return False
+
+        # Public suffixes can only be registered if they are local
+        if private_generation == 0 and self.name not in settings.LOCAL_PUBLIC_SUFFIXES:
+            return False
+
+        # Disallow _acme-challenge.dedyn.io and the like. Rejects reserved direct children of public suffixes.
+        reserved_prefixes = ('_', 'autoconfig.', 'autodiscover.',)
+        if private_generation == 1 and any(self.name.startswith(prefix) for prefix in reserved_prefixes):
+            return False
+
+        # Domains covered by another user's zone can't be registered
+        if self.is_covered_by_foreign_zone():
+            return False
+
+        # Domains that would cover another user's zone can't be registered
+        if self.covers_foreign_zone():
+            return False
+
+        return True
 
     @property
     def keys(self):
@@ -279,8 +338,25 @@ class Domain(ExportModelOperationsMixin('Domain'), models.Model):
         return self._keys
 
     @property
+    def touched(self):
+        try:
+            rrset_touched = max(updated for updated in self.rrset_set.values_list('touched', flat=True))
+            # If the domain has not been published yet, self.published is None and max() would fail
+            return rrset_touched if not self.published else max(rrset_touched, self.published)
+        except ValueError:
+            # This can be none if the domain was never published and has no records (but there should be at least NS)
+            return self.published
+
+    @property
     def is_locally_registrable(self):
         return self.parent_domain_name in settings.LOCAL_PUBLIC_SUFFIXES
+
+    @property
+    def _owner_or_none(self):
+        try:
+            return self.owner
+        except Domain.owner.RelatedObjectDoesNotExist:
+            return None
 
     @property
     def parent_domain_name(self):
@@ -301,8 +377,12 @@ class Domain(ExportModelOperationsMixin('Domain'), models.Model):
             raise ValueError('Cannot update delegation of %s as it is not an immediate child domain of %s.' %
                              (child_domain.name, self.name))
 
+        # Always remove delegation so that we con properly recreate it
+        for rrset in self.rrset_set.filter(subname=child_subname, type__in=['NS', 'DS']):
+            rrset.delete()
+
         if child_domain.pk:
-            # Domain real: set delegation
+            # Domain real: (re-)set delegation
             child_keys = child_domain.keys
             if not child_keys:
                 raise APIException('Cannot delegate %s, as it currently has no keys.' % child_domain.name)
@@ -312,9 +392,7 @@ class Domain(ExportModelOperationsMixin('Domain'), models.Model):
                                  contents=[ds for k in child_keys for ds in k['ds']])
             metrics.get('desecapi_autodelegation_created').inc()
         else:
-            # Domain not real: remove delegation
-            for rrset in self.rrset_set.filter(subname=child_subname, type__in=['NS', 'DS']):
-                rrset.delete()
+            # Domain not real: that's it
             metrics.get('desecapi_autodelegation_deleted').inc()
 
     def delete(self):
@@ -329,31 +407,108 @@ class Domain(ExportModelOperationsMixin('Domain'), models.Model):
         ordering = ('created',)
 
 
-def get_default_value_created():
-    return timezone.now()
+class Token(ExportModelOperationsMixin('Token'), rest_framework.authtoken.models.Token):
+    @staticmethod
+    def _allowed_subnets_default():
+        return [ipaddress.IPv4Network('0.0.0.0/0'), ipaddress.IPv6Network('::/0')]
 
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.CharField("Key", max_length=128, db_index=True, unique=True)
+    user = models.ForeignKey(
+        User, related_name='auth_tokens',
+        on_delete=models.CASCADE, verbose_name="User"
+    )
+    name = models.CharField('Name', blank=True, max_length=64)
+    last_used = models.DateTimeField(null=True, blank=True)
+    perm_manage_tokens = models.BooleanField(default=False)
+    allowed_subnets = ArrayField(CidrAddressField(), default=_allowed_subnets_default.__func__)
+    max_age = models.DurationField(null=True, default=None, validators=[MinValueValidator(timedelta(0))])
+    max_unused_period = models.DurationField(null=True, default=None, validators=[MinValueValidator(timedelta(0))])
 
-def get_default_value_due():
-    return timezone.now() + timedelta(days=7)
+    plain = None
+    objects = NetManager()
 
+    @property
+    def is_valid(self):
+        now = timezone.now()
 
-def get_default_value_mref():
-    return "ONDON" + str(time.time())
+        # Check max age
+        try:
+            if self.created + self.max_age < now:
+                return False
+        except TypeError:
+            pass
+
+        # Check regular usage requirement
+        try:
+            if (self.last_used or self.created) + self.max_unused_period < now:
+                return False
+        except TypeError:
+            pass
+
+        return True
+
+    def generate_key(self):
+        self.plain = secrets.token_urlsafe(21)
+        self.key = Token.make_hash(self.plain)
+        return self.key
+
+    @staticmethod
+    def make_hash(plain):
+        return make_password(plain, salt='static', hasher='pbkdf2_sha256_iter1')
 
 
 class Donation(ExportModelOperationsMixin('Donation'), models.Model):
-    created = models.DateTimeField(default=get_default_value_created)
+    @staticmethod
+    def _created_default():
+        return timezone.now()
+
+    @staticmethod
+    def _due_default():
+        return timezone.now() + timedelta(days=7)
+
+    @staticmethod
+    def _mref_default():
+        return "ONDON" + str(time.time())
+
+    created = models.DateTimeField(default=_created_default.__func__)
     name = models.CharField(max_length=255)
     iban = models.CharField(max_length=34)
     bic = models.CharField(max_length=11, blank=True)
     amount = models.DecimalField(max_digits=8, decimal_places=2)
     message = models.CharField(max_length=255, blank=True)
-    due = models.DateTimeField(default=get_default_value_due)
-    mref = models.CharField(max_length=32, default=get_default_value_mref)
+    due = models.DateTimeField(default=_due_default.__func__)
+    mref = models.CharField(max_length=32, default=_mref_default.__func__)
     email = models.EmailField(max_length=255, blank=True)
 
     class Meta:
         managed = False
+
+
+# RR set types: the good, the bad, and the ugly
+# known, but unsupported types
+RR_SET_TYPES_UNSUPPORTED = {
+    'ALIAS',  # Requires signing at the frontend, hence unsupported in desec-stack
+    'DNAME',  # "do not combine with DNSSEC", https://doc.powerdns.com/authoritative/settings.html#dname-processing
+    'IPSECKEY',  # broken in pdns, https://github.com/PowerDNS/pdns/issues/9055 TODO enable with pdns auth 4.5.0
+    'KEY',  # Application use restricted by RFC 3445, DNSSEC use replaced by DNSKEY and handled automatically
+    'WKS',  # General usage not recommended, "SHOULD NOT" be used in SMTP (RFC 1123)
+}
+# restricted types are managed in use by the API, and cannot directly be modified by the API client
+RR_SET_TYPES_AUTOMATIC = {
+    # corresponding functionality is automatically managed:
+    'KEY', 'NSEC', 'NSEC3', 'OPT', 'RRSIG',
+    # automatically managed by the API:
+    'NSEC3PARAM', 'SOA'
+}
+# backend types are types that are the types supported by the backend(s)
+RR_SET_TYPES_BACKEND = pdns.SUPPORTED_RRSET_TYPES
+# validation types are types supported by the validation backend, currently: dnspython
+RR_SET_TYPES_VALIDATION = set(ANY.__all__) | set(IN.__all__) \
+                          | {'HTTPS', 'SVCB'}  # https://github.com/rthalley/dnspython/pull/624
+# manageable types are directly managed by the API client
+RR_SET_TYPES_MANAGEABLE = \
+        (RR_SET_TYPES_BACKEND & RR_SET_TYPES_VALIDATION) - RR_SET_TYPES_UNSUPPORTED - RR_SET_TYPES_AUTOMATIC
 
 
 class RRsetManager(Manager):
@@ -367,7 +522,7 @@ class RRsetManager(Manager):
 class RRset(ExportModelOperationsMixin('RRset'), models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     created = models.DateTimeField(auto_now_add=True)
-    updated = models.DateTimeField(null=True)  # undocumented, used for debugging only
+    touched = models.DateTimeField(auto_now=True, db_index=True)
     domain = models.ForeignKey(Domain, on_delete=models.CASCADE)
     subname = models.CharField(
         max_length=178,
@@ -375,9 +530,9 @@ class RRset(ExportModelOperationsMixin('RRset'), models.Model):
         validators=[
             validate_lower,
             RegexValidator(
-                regex=r'^([*]|(([*][.])?[a-z0-9_.-]*))$',
+                regex=r'^([*]|(([*][.])?([a-z0-9_-]{1,63}[.])*[a-z0-9_-]{1,63}))$',
                 message='Subname can only use (lowercase) a-z, 0-9, ., -, and _, '
-                        'may start with a \'*.\', or just be \'*\'.',
+                        'may start with a \'*.\', or just be \'*\'. Components may not exceed 63 characters.',
                 code='invalid_subname'
             )
         ]
@@ -397,10 +552,17 @@ class RRset(ExportModelOperationsMixin('RRset'), models.Model):
 
     objects = RRsetManager()
 
-    DEAD_TYPES = ('ALIAS', 'DNAME')
-    RESTRICTED_TYPES = ('SOA', 'RRSIG', 'DNSKEY', 'NSEC3PARAM', 'OPT')
-
     class Meta:
+        constraints = [
+            ExclusionConstraint(
+                name='cname_exclusivity',
+                expressions=[
+                    ('domain', RangeOperators.EQUAL),
+                    ('subname', RangeOperators.EQUAL),
+                    (RawSQL("int4(type = 'CNAME')", ()), RangeOperators.NOT_EQUAL),
+                ],
+            ),
+        ]
         unique_together = (("domain", "subname", "type"),)
 
     @staticmethod
@@ -412,9 +574,78 @@ class RRset(ExportModelOperationsMixin('RRset'), models.Model):
         return self.construct_name(self.subname, self.domain.name)
 
     def save(self, *args, **kwargs):
-        self.updated = timezone.now()
         self.full_clean(validate_unique=False)
         super().save(*args, **kwargs)
+
+    def clean_records(self, records_presentation_format):
+        """
+        Validates the records belonging to this set. Validation rules follow the DNS specification; some types may
+        incur additional validation rules.
+
+        Raises ValidationError if violation of DNS specification is found.
+
+        Returns a set of records in canonical presentation format.
+
+        :param records_presentation_format: iterable of records in presentation format
+        """
+        errors = []
+
+        if self.type == 'CNAME':
+            if self.subname == '':
+                errors.append('CNAME RRset cannot have empty subname.')
+            if len(records_presentation_format) > 1:
+                errors.append('CNAME RRset cannot have multiple records.')
+
+        def _error_msg(record, detail):
+            return f'Record content of {self.type} {self.name} invalid: \'{record}\': {detail}'
+
+        records_canonical_format = set()
+        for r in records_presentation_format:
+            try:
+                r_canonical_format = RR.canonical_presentation_format(r, self.type)
+            except ValueError as ex:
+                errors.append(_error_msg(r, str(ex)))
+            else:
+                if r_canonical_format in records_canonical_format:
+                    errors.append(_error_msg(r, f'Duplicate record content: this is identical to '
+                                                f'\'{r_canonical_format}\''))
+                else:
+                    records_canonical_format.add(r_canonical_format)
+
+        if any(errors):
+            raise ValidationError(errors)
+
+        return records_canonical_format
+
+    def save_records(self, records):
+        """
+        Updates this RR set's resource records, discarding any old values.
+
+        Records are expected in presentation format and are converted to canonical
+        presentation format (e.g., 127.00.0.1 will be converted to 127.0.0.1).
+        Raises if a invalid set of records is provided.
+
+        This method triggers the following database queries:
+        - one DELETE query
+        - one SELECT query for comparison of old with new records
+        - one INSERT query, if one or more records were added
+
+        Changes are saved to the database immediately.
+
+        :param records: list of records in presentation format
+        """
+        new_records = self.clean_records(records)
+
+        # Delete RRs that are not in the new record list from the DB
+        self.records.exclude(content__in=new_records).delete()  # one DELETE
+
+        # Retrieve all remaining RRs from the DB
+        unchanged_records = set(r.content for r in self.records.all())  # one SELECT
+
+        # Save missing RRs from the new record list to the DB
+        added_records = new_records - unchanged_records
+        rrs = [RR(rrset=self, content=content) for content in added_records]
+        RR.objects.bulk_create(rrs)  # One INSERT
 
     def __str__(self):
         return '<RRSet %s domain=%s type=%s subname=%s>' % (self.pk, self.domain.name, self.type, self.subname)
@@ -435,25 +666,73 @@ class RRManager(Manager):
 class RR(ExportModelOperationsMixin('RR'), models.Model):
     created = models.DateTimeField(auto_now_add=True)
     rrset = models.ForeignKey(RRset, on_delete=models.CASCADE, related_name='records')
-    # The pdns lmdb backend used on our slaves does not only store the record contents itself, but other metadata (such
-    # as type etc.) Both together have to fit into the lmdb backend's current total limit of 512 bytes per RR, see
-    # https://github.com/PowerDNS/pdns/issues/8012
-    # I found the additional data to be 12 bytes (by trial and error). I believe these are the 12 bytes mentioned here:
-    # https://lists.isc.org/pipermail/bind-users/2008-April/070137.html So we can use 500 bytes for the actual content.
-    # Note: This is a conservative estimate, as record contents may be stored more efficiently depending on their type,
-    # effectively allowing a longer length in "presentation format". For example, A record contents take up 4 bytes,
-    # although the presentation format (usual IPv4 representation) takes up to 15 bytes. Similarly, OPENPGPKEY contents
-    # are base64-decoded before storage in binary format, so a "presentation format" value (which is the value our API
-    # sees) can have up to 668 bytes. Instead of introducing per-type limits, setting it to 500 should always work.
-    content = models.CharField(max_length=500)  #
+    content = models.TextField()
 
     objects = RRManager()
+
+    _type_map = {
+        dns.rdatatype.CDS: CDS,  # TODO remove when https://github.com/rthalley/dnspython/pull/625 is in main codebase
+        dns.rdatatype.DLV: DLV,  # TODO remove when https://github.com/rthalley/dnspython/pull/625 is in main codebase
+        dns.rdatatype.DS: DS,  # TODO remove when https://github.com/rthalley/dnspython/pull/625 is in main codebase
+        dns.rdatatype.TXT: LongQuotedTXT,  # we slightly deviate from RFC 1035 and allow tokens longer than 255 bytes
+        dns.rdatatype.SPF: LongQuotedTXT,  # we slightly deviate from RFC 1035 and allow tokens longer than 255 bytes
+    }
+
+    @staticmethod
+    def canonical_presentation_format(any_presentation_format, type_):
+        """
+        Converts any valid presentation format for a RR into it's canonical presentation format.
+        Raises if provided presentation format is invalid.
+        """
+        rdtype = rdatatype.from_text(type_)
+
+        try:
+            # Convert to wire format, ensuring input validation.
+            cls = RR._type_map.get(rdtype, dns.rdata)
+            wire = cls.from_text(
+                rdclass=rdataclass.IN,
+                rdtype=rdtype,
+                tok=dns.tokenizer.Tokenizer(any_presentation_format),
+                relativize=False
+            ).to_digestable()
+
+            if len(wire) > 64000:
+                raise ValidationError(f'Ensure this value has no more than 64000 byte in wire format (it has {len(wire)}).')
+
+            parser = dns.wire.Parser(wire, current=0)
+            with parser.restrict_to(len(wire)):
+                rdata = cls.from_wire_parser(rdclass=rdataclass.IN, rdtype=rdtype, parser=parser)
+
+            # Convert to canonical presentation format, disable chunking of records.
+            # Exempt types which have chunksize hardcoded (prevents "got multiple values for keyword argument 'chunksize'").
+            chunksize_exception_types = (dns.rdatatype.OPENPGPKEY, dns.rdatatype.EUI48, dns.rdatatype.EUI64)
+            if rdtype in chunksize_exception_types:
+                return rdata.to_text()
+            else:
+                return rdata.to_text(chunksize=0)
+        except binascii.Error:
+            # e.g., odd-length string
+            raise ValueError('Cannot parse hexadecimal or base64 record contents')
+        except dns.exception.SyntaxError as e:
+            # e.g., A/127.0.0.999
+            if 'quote' in e.args[0]:
+                raise ValueError(f'Data for {type_} records must be given using quotation marks.')
+            else:
+                raise ValueError(f'Record content for type {type_} malformed: {",".join(e.args)}')
+        except dns.name.NeedAbsoluteNameOrOrigin:
+            raise ValueError('Hostname must be fully qualified (i.e., end in a dot: "example.com.")')
+        except ValueError as ex:
+            # e.g., string ("asdf") cannot be parsed into int on base 10
+            raise ValueError(f'Cannot parse record contents: {ex}')
+        except Exception as e:
+            # TODO see what exceptions raise here for faulty input
+            raise e
 
     def __str__(self):
         return '<RR %s %s rr_set=%s>' % (self.pk, self.content, self.rrset.pk)
 
 
-class AuthenticatedAction(ExportModelOperationsMixin('AuthenticatedAction'), models.Model):
+class AuthenticatedAction(models.Model):
     """
     Represents a procedure call on a defined set of arguments.
 
@@ -509,8 +788,6 @@ class AuthenticatedAction(ExportModelOperationsMixin('AuthenticatedAction'), mod
 
         :return: List of values to be signed.
         """
-        # TODO consider adding a "last change" attribute of the user to the state to avoid code
-        #  re-use after the the state has been changed and changed back.
         name = '.'.join([self.__module__, self.__class__.__qualname__])
         return [name]
 
@@ -537,10 +814,9 @@ class AuthenticatedAction(ExportModelOperationsMixin('AuthenticatedAction'), mod
         return self._act()
 
 
-class AuthenticatedUserAction(ExportModelOperationsMixin('AuthenticatedUserAction'), AuthenticatedAction):
+class AuthenticatedBasicUserAction(AuthenticatedAction):
     """
-    Abstract AuthenticatedAction involving an user instance, incorporating the user's id, email, password, and
-    is_active flag into the Message Authentication Code state.
+    Abstract AuthenticatedAction involving a user instance.
     """
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
 
@@ -549,13 +825,26 @@ class AuthenticatedUserAction(ExportModelOperationsMixin('AuthenticatedUserActio
 
     @property
     def _state_fields(self):
-        return super()._state_fields + [str(self.user.id), self.user.email, self.user.password, self.user.is_active]
-
-    def _act(self):
-        raise NotImplementedError
+        return super()._state_fields + [str(self.user.id)]
 
 
-class AuthenticatedActivateUserAction(ExportModelOperationsMixin('AuthenticatedActivateUserAction'), AuthenticatedUserAction):
+class AuthenticatedUserAction(AuthenticatedBasicUserAction):
+    """
+    Abstract AuthenticatedBasicUserAction, incorporating the user's id, email, password, and is_active flag into the
+    Message Authentication Code state.
+    """
+
+    class Meta:
+        managed = False
+
+    @property
+    def _state_fields(self):
+        # TODO consider adding a "last change" attribute of the user to the state to avoid code
+        #  re-use after the the state has been changed and changed back.
+        return super()._state_fields + [self.user.email, self.user.password, self.user.is_active]
+
+
+class AuthenticatedActivateUserAction(AuthenticatedUserAction):
     domain = models.CharField(max_length=191)
 
     class Meta:
@@ -569,7 +858,7 @@ class AuthenticatedActivateUserAction(ExportModelOperationsMixin('AuthenticatedA
         self.user.activate()
 
 
-class AuthenticatedChangeEmailUserAction(ExportModelOperationsMixin('AuthenticatedChangeEmailUserAction'), AuthenticatedUserAction):
+class AuthenticatedChangeEmailUserAction(AuthenticatedUserAction):
     new_email = models.EmailField()
 
     class Meta:
@@ -583,7 +872,7 @@ class AuthenticatedChangeEmailUserAction(ExportModelOperationsMixin('Authenticat
         self.user.change_email(self.new_email)
 
 
-class AuthenticatedResetPasswordUserAction(ExportModelOperationsMixin('AuthenticatedResetPasswordUserAction'), AuthenticatedUserAction):
+class AuthenticatedResetPasswordUserAction(AuthenticatedUserAction):
     new_password = models.CharField(max_length=128)
 
     class Meta:
@@ -593,7 +882,7 @@ class AuthenticatedResetPasswordUserAction(ExportModelOperationsMixin('Authentic
         self.user.change_password(self.new_password)
 
 
-class AuthenticatedDeleteUserAction(ExportModelOperationsMixin('AuthenticatedDeleteUserAction'), AuthenticatedUserAction):
+class AuthenticatedDeleteUserAction(AuthenticatedUserAction):
 
     class Meta:
         managed = False
@@ -602,20 +891,70 @@ class AuthenticatedDeleteUserAction(ExportModelOperationsMixin('AuthenticatedDel
         self.user.delete()
 
 
-def captcha_default_content():
-    alphabet = (string.ascii_uppercase + string.digits).translate({ord(c): None for c in 'IO0'})
-    content = ''.join([secrets.choice(alphabet) for _ in range(5)])
-    metrics.get('desecapi_captcha_content_created').inc()
+class AuthenticatedDomainBasicUserAction(AuthenticatedBasicUserAction):
+    """
+    Abstract AuthenticatedUserAction involving an domain instance, incorporating the domain's id, name as well as the
+    owner ID into the Message Authentication Code state.
+    """
+    domain = models.ForeignKey(Domain, on_delete=models.DO_NOTHING)
+
+    class Meta:
+        managed = False
+
+    @property
+    def _state_fields(self):
+        return super()._state_fields + [
+            str(self.domain.id),  # ensures the domain object is identical
+            self.domain.name,  # exclude renamed domains
+            str(self.domain.owner.id),  # exclude transferred domains
+        ]
+
+
+class AuthenticatedRenewDomainBasicUserAction(AuthenticatedDomainBasicUserAction):
+
+    class Meta:
+        managed = False
+
+    @property
+    def _state_fields(self):
+        return super()._state_fields + [str(self.domain.renewal_changed)]
+
+    def _act(self):
+        self.domain.renewal_state = Domain.RenewalState.FRESH
+        self.domain.renewal_changed = timezone.now()
+        self.domain.save(update_fields=['renewal_state', 'renewal_changed'])
+
+
+def captcha_default_content(kind: str) -> str:
+    if kind == Captcha.Kind.IMAGE:
+        alphabet = (string.ascii_uppercase + string.digits).translate({ord(c): None for c in 'IO0'})
+        length = 5
+    elif kind == Captcha.Kind.AUDIO:
+        alphabet = string.digits
+        length = 8
+    else:
+        raise ValueError(f'Unknown Captcha kind: {kind}')
+
+    content = ''.join([secrets.choice(alphabet) for _ in range(length)])
+    metrics.get('desecapi_captcha_content_created').labels(kind).inc()
     return content
 
 
 class Captcha(ExportModelOperationsMixin('Captcha'), models.Model):
+
+    class Kind(models.TextChoices):
+        IMAGE = 'image'
+        AUDIO = 'audio'
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     created = models.DateTimeField(auto_now_add=True)
-    content = models.CharField(
-        max_length=24,
-        default=captcha_default_content,
-    )
+    content = models.CharField(max_length=24, default="")
+    kind = models.CharField(choices=Kind.choices, default=Kind.IMAGE, max_length=24)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.content:
+            self.content = captcha_default_content(self.kind)
 
     def verify(self, solution: str):
         age = timezone.now() - self.created

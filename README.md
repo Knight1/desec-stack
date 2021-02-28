@@ -6,7 +6,7 @@ This is a docker-compose application providing the basic stack for deSEC name se
 - `nslord`: Eventually authoritative DNS server (PowerDNS). DNSSEC keying material is generated here.
 - `nsmaster`: Stealth authoritative DNS server (PowerDNS). Receives fully signed AXFR zone transfers from `nslord`. No access to keys.
 - `api`: RESTful API to create deSEC users and domains, see [documentation](https://desec.readthedocs.io/).
-- `dbapi`, `dblord`, `dbmaster`: MariaDB database services for `api`, `nslord`, and `nsmaster`, respectively.
+- `dbapi`, `dblord`, `dbmaster`: Postgres database for `api`, MariaDB databases for `nslord` and `nsmaster`, respectively.
 - `www`: nginx instance serving static web site content and proxying to `api`
 - `celery`: A shadow instance of the `api` code for performing asynchronous tasks (email delivery).
 - `rabbitmq`: `celery`'s queue
@@ -52,7 +52,7 @@ Although most configuration is contained in this repository, some external depen
       - `DESECSTACK_API_EMAIL_PORT`: port for sending email
       - `DESECSTACK_API_SECRETKEY`: Django secret
       - `DESECSTACK_API_PSL_RESOLVER`: Resolver IP address to use for PSL lookups. If empty, the system's default resolver is used.
-      - `DESECSTACK_DBAPI_PASSWORD_desec`: mysql password for desecapi
+      - `DESECSTACK_DBAPI_PASSWORD_desec`: database password for desecapi
       - `DESECSTACK_MINIMUM_TTL_DEFAULT`: minimum TTL users can set for RRsets. The setting is per domain, and the default defined here is used on domain creation.
     - nslord-related
       - `DESECSTACK_DBLORD_PASSWORD_pdns`: mysql password for pdns on nslord
@@ -82,8 +82,8 @@ Production:
 
 Storage
 -------
-All important data is stored in the databases managed by the `db*` containers. They use Docker volumes which, by default, reside in `/var/lib/docker/volumes/desecstack_{dbapi,dblord,dbmaster}_mysql`.
-This is the location you will want to back up. (Be sure to follow standard MySQL backup practices, i.e. make sure things are consistent.)
+All important data is stored in the databases managed by the `db*` containers. They use Docker volumes which, by default, reside in `/var/lib/docker/volumes/desec-stack_{dbapi_postgres,dblord_mysql,dbmaster_mysql}`.
+This is the location you will want to back up. (Be sure to follow standard MySQL/Postgres backup practices, i.e. make sure things are consistent.)
 
 API Versions and Roadmap
 ------------------------
@@ -130,15 +130,15 @@ Development: Getting Started Guide
 As desec-stack utilizes a number of different technologies and software packages, it requires some effort to setup a stack ready for development.
 While there are certainly many ways to get started hacking desec-stack, here is one way to do it.
 
-1. **Requirements.** This guide is intended and tested on Ubuntu 18.04.
+1. **Requirements.** This guide is intended and tested on Ubuntu 20.20.
     However, many other Linux distributions will also do fine.
     For desec-stack, [docker](https://docs.docker.com/install/linux/docker-ce/ubuntu/) and [docker-compose](https://docs.docker.com/compose/install/) are required.
     Further tools that are required to start hacking are git and curl.
     Recommended, but not strictly required for desec-stack development is to use certbot along with Let's Encrypt and PyCharm.
-    jq, httpie, libmysqlclient-dev, python3-dev (>= 3.7) and python3-venv (>= 3.7) are useful if you want to follow this guide.
-    To install everything you need for this guide except docker and docker-compose, use
+    jq, httpie, libmariadbclient-dev, libpq-dev, python3-dev (>= 3.8) and python3-venv (>= 3.8) are useful if you want to follow this guide.
+    The webapp requires nodejs. To install everything you need for this guide except docker and docker-compose, use
 
-       sudo apt install curl git httpie jq libmysqlclient-dev python3.7-dev python3.7-venv
+       sudo apt install certbot curl git httpie jq libmariadbclient-dev libpq-dev nodejs npm python3-dev python3-venv libmemcached-dev
 
 1. **Get the code.** Clone this repository to your favorite location.
 
@@ -183,7 +183,7 @@ While there are certainly many ways to get started hacking desec-stack, here is 
 
        mkdir -p ~/bin
        cd ~/bin
-       curl https://raw.githubusercontent.com/desec-utils/certbot-hook/master/hook.sh > desec_certbot_hook.sh
+       curl https://raw.githubusercontent.com/desec-io/desec-certbot-hook/master/hook.sh > desec_certbot_hook.sh
        touch .dedynauth; chmod 600 .dedynauth
        echo DEDYN_TOKEN=${TOKEN} >> .dedynauth
        echo DEDYN_NAME=${DOMAIN} >> .dedynauth
@@ -195,8 +195,11 @@ While there are certainly many ways to get started hacking desec-stack, here is 
            --config-dir certbot/config --logs-dir certbot/logs --work-dir certbot/work \
            --manual --text --preferred-challenges dns \
            --manual-auth-hook ~/bin/desec_certbot_hook.sh \
+           --manual-cleanup-hook ~/bin/desec_certbot_hook.sh \
            --server https://acme-v02.api.letsencrypt.org/directory \
-           -d "*.${DOMAIN}" certonly
+           -d "*.${DOMAIN}" -d "update.dedyn.${DOMAIN}" -d "update4.dedyn.$DOMAIN" -d "update6.dedyn.$DOMAIN" \
+           -d "checkip.dedyn.${DOMAIN}" -d "checkipv4.dedyn.${DOMAIN}" -d "checkipv6.dedyn.${DOMAIN}" \
+           certonly
 
     Note that the definition of config, logs and work dir are only necessary if you do not want to run certbot as root.
     Verifying the DNS challenge takes a while, so allow this command to take a couple of minutes.
@@ -232,7 +235,7 @@ While there are certainly many ways to get started hacking desec-stack, here is 
     Additionally, the VPN server for the replication network needs to be equipped with a pre-shared key (PSK) and a public key infrastructure (PKI).
     To generate the PSK, use the openvpn-server container:
 
-        docker-compose run openvpn-server openvpn --genkey --secret /dev/stdout > openvpn-server/secrets/ta.key
+        docker-compose build openvpn-server && docker-compose run openvpn-server openvpn --genkey --secret /dev/stdout > openvpn-server/secrets/ta.key
 
     To build the PKI, we recommend [easy RSA](https://github.com/OpenVPN/easy-rsa).
     **Please note that PKI instructions here are for development deployments only!**
@@ -255,7 +258,7 @@ While there are certainly many ways to get started hacking desec-stack, here is 
     To issue a certificate for the OpenVPN server, generate a new key pair, a signing request, and sign the certificate.
 
          ./easyrsa gen-req server nopass
-         ./easyrsa sign-req client server  # requires interaction
+         ./easyrsa sign-req server server  # requires interaction
 
     Make the key and certificate available to OpenVPN server:
 
@@ -265,6 +268,12 @@ While there are certainly many ways to get started hacking desec-stack, here is 
     As the setup of OpenVPN is completed, return to the project directory:
 
         cd -
+
+1. **Install webapp dependencies.** To install the dependencies for the web site and GUI, run
+
+       cd webapp/
+       npm install
+       cd -
 
 1. **Run desec-stack.** To run desec-stack, use
 
@@ -303,7 +312,7 @@ While there are certainly many ways to get started hacking desec-stack, here is 
         In the project root,
 
            cd api
-           python3.7 -m venv venv
+           python3 -m venv venv
            source venv/bin/activate
            pip install wheel
            pip install -r requirements.txt
@@ -315,11 +324,22 @@ While there are certainly many ways to get started hacking desec-stack, here is 
 
            set -a && source ../.env && set +a
 
-        Second, the API needs to be configured to use a local database instead of the dbapi host.
-        (dbapi, of course, is unavailable outside the docker-compose application.)
-        We have configured a test database in `settings_quick_test.py`. To use this configuration instead of the default `settings.py`, set the following environment variable:
+        Second, to make the tests run efficiently, a couple of settings are different from the production system:
+        passwords are hashed using a fast (but insecure!) method, rate limits are switched off, and so on.
+        To use the fast settings in your shell, run
 
            export DJANGO_SETTINGS_MODULE=api.settings_quick_test
+
+        Third, the API needs a postgres database to run the tests. To serve as a test database,
+        the `dbapi` container can be started using a test configuration which exposes the database at
+        `127.0.0.1`. In order to let Django know that the database is at `127.0.0.1` instead of the
+        usual `dbapi`, set an additional environment variable:
+
+           export DESECSTACK_DJANGO_TEST=1
+
+        Fourth, run the database:
+
+            docker-compose -f docker-compose.yml -f docker-compose.test-api.yml up -d dbapi
 
         Finally, you can manage Django using the `manage.py` CLI.
         As an example, to run the tests, use
@@ -328,14 +348,20 @@ While there are certainly many ways to get started hacking desec-stack, here is 
 
     1. Open the project root directory `desec-stack` in PyCharm and select File › Settings.
         1. In Project: desec-stack › Project Structure, mark the `api/` folder as a source folder.
-        2. In Project: desec-stack › Project Interpreter, add a new interpreter. Choose "existing environment" and select `api/api/venv/bin/python3` from the project root.
+        2. In Project: desec-stack › Project Interpreter, add a new interpreter. Choose "existing environment" and select `api/venv/bin/python3` from the project root.
         3. In Languages & Frameworks › Django, enable the Django support and set the Django project root to `api/`.
 
     1. From the PyCharm menu, select Run › Edit Configurations and select the "Django tests" template from the list.
         1. Open the Environment Variables dialog. Copy the contents of the `.env` file and paste it here.
-        2. Fill the Custom Settings field with the path to the `settings_quick_test` module.
+        2. Add an environment variable with the name `DESECSTACK_DJANGO_TEST` and the value `1`.
+        3. Fill the Custom Settings field with the path to the `settings_quick_test` module.
+        4. At the bottom in the "Before launch" sections, add an "External tool" with the following settings:
+           - Name: `Postgres Test Container`
+           - Program: `docker-compose`
+           - Arguments: `-f docker-compose.yml -f docker-compose.test-api.yml up -d dbapi`
 
     1. To see if the test configuration is working, right click on the api folder in the project view and select Run Test.
+       (Note that the first attempt may fail in case the `dbapi` container does not start up fast enough. In that case, just try again.)
 
     1. To use code inspection, click on Inspect Code… in PyCharm's Code menu and add a local custom scope with the following pattern:
 
@@ -344,3 +370,22 @@ While there are certainly many ways to get started hacking desec-stack, here is 
     From this point on, you are set up to use most of PyCharm's convenience features.
 
     1. For PyCharm's Python Console, the environment variables of your `.env` file and `DJANGO_SETTINGS_MODULE=api.settings_quick_test` need to be configured in Settings › Build, Execution, Deployment › Console › Django Console. (Note that if you need to work with the database, you need to initialize it first by running all migrations; otherwise, the model tables will be missing from the database.)
+
+
+## Debugging
+
+### RabbitMQ
+
+To access message queue information of RabbitMQ, use the RabbitMQ management plugin. First, port 15672 of the RabbitMQ
+container needs to be exposed (default when using `docker-compose.dev.yml`). Then, inside the container, create a user
+that can access the RabbitMQ data:
+
+```
+rabbitmq-plugins enable rabbitmq_management
+rabbitmqctl add_user admin admin
+rabbitmqctl set_user_tags admin administrator
+rabbitmqctl set_permissions admin '.*' '.*' '.*'
+```
+
+Then the web-based management interface will be available at http://localhost:15672 with user `admin` and password
+`admin`.

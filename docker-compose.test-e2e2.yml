@@ -1,0 +1,97 @@
+version: '2.2'
+
+# mostly extending from main .yml
+services:
+  www:
+    environment:
+    - DESECSTACK_E2E_TEST=TRUE # increase abuse limits and such
+    volumes:
+    - autocert:/autocert/
+
+  api:
+    environment:
+    - DESECSTACK_E2E_TEST=TRUE # increase abuse limits and such
+    # faketime setup
+    - LD_PRELOAD=/lib/libfaketime.so
+    - FAKETIME_TIMESTAMP_FILE=/etc/faketime/faketime.rc
+    - FAKETIME_NO_CACHE=1
+    volumes:
+    - faketime:/etc/faketime/:ro
+
+  celery-email:
+    environment:
+    - DESECSTACK_E2E_TEST=TRUE # increase abuse limits and such
+    # faketime setup
+    - LD_PRELOAD=/lib/libfaketime.so
+    - FAKETIME_TIMESTAMP_FILE=/etc/faketime/faketime.rc
+    - FAKETIME_NO_CACHE=1
+    volumes:
+    - faketime:/etc/faketime/:ro
+
+  celery-replication:
+    environment:
+    - DESECSTACK_E2E_TEST=TRUE # increase abuse limits and such
+    # faketime setup
+    - LD_PRELOAD=/lib/libfaketime.so
+    - FAKETIME_TIMESTAMP_FILE=/etc/faketime/faketime.rc
+    - FAKETIME_NO_CACHE=1
+    volumes:
+    - faketime:/etc/faketime/:ro
+
+  nslord:
+    networks:
+      front:
+        ipv4_address: ${DESECSTACK_IPV4_REAR_PREFIX16}.0.129 # make nslord available for test-e2e
+    environment:
+    - DESECSTACK_NSLORD_CACHE_TTL=0
+    # faketime setup
+    - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
+    - FAKETIME_TIMESTAMP_FILE=/etc/faketime/faketime.rc
+    - FAKETIME_NO_CACHE=1
+    ports:
+    - "5311:53"
+    - "5311:53/udp"
+    volumes:
+    - faketime:/etc/faketime/:ro
+
+  test-e2e2:
+    build: test/e2e2
+    restart: "no"
+    environment:
+    - DESECSTACK_DOMAIN
+    - DESECSTACK_NS
+    - DESECSTACK_IPV4_REAR_PREFIX16
+    - DESECSTACK_IPV6_SUBNET
+    - DESECSTACK_IPV6_ADDRESS
+    - DESECSTACK_NSLORD_DEFAULT_TTL
+    # faketime setup
+    - LD_PRELOAD=/lib/libfaketime.so
+    - FAKETIME_TIMESTAMP_FILE=/etc/faketime/faketime.rc
+    - FAKETIME_NO_CACHE=1
+    volumes:
+    - autocert:/autocert/:ro
+    - zones:/zones:ro
+    - faketime:/etc/faketime/:rw
+    mac_address: 06:42:ac:10:00:7f
+    depends_on:
+    - www
+    - nslord
+    - nsmaster
+    networks:
+      front:
+        ipv4_address: ${DESECSTACK_IPV4_REAR_PREFIX16}.0.127
+    extra_hosts:
+    - "checkipv4.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "checkipv6.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "checkip.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "desec.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "update6.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "update.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "www.dedyn.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "www.desec.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+    - "get.desec.${DESECSTACK_DOMAIN}:${DESECSTACK_IPV4_REAR_PREFIX16}.0.128"
+
+volumes:
+  autocert:
+  faketime:

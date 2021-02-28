@@ -6,7 +6,7 @@ Retrieving and Creating DNS Records
 All DNS information is composed of so-called *Resource Record Sets*
 (*RRsets*).  An RRset is the set of all Resource Records of a given record
 type for a given name.  For example, the name ``example.com`` may have an
-RRset of type ``A``, denoting the set of IPv4 addresses associatd with this
+RRset of type ``A``, denoting the set of IPv4 addresses associated with this
 name.  In the traditional Bind zone file format, the RRset would be written
 as::
 
@@ -19,11 +19,14 @@ Each of these lines is a Resource Record, and together they form an RRset.
 The basic units accessible through the API are RRsets, each represented by a
 JSON object.  The object structure is detailed in the next section.
 
-The relevant endpoints all reside under ``/api/v1/domains/:name/rrsets/``,
-where ``:name`` is the name of a domain you own.  When operating on domains
+The relevant endpoints all reside under ``/api/v1/domains/{name}/rrsets/``,
+where ``{name}`` is the name of a domain you own.  When operating on domains
 that don't exist or you don't own, the API responds with a ``404 Not Found``
 status code.  For a quick overview of the available endpoints, methods, and
 operations, see :ref:`endpoint-reference`.
+
+All operations are subject to rate limiting.  For details, see
+:ref:`rate-limits`.
 
 
 .. _`RRset object`:
@@ -43,7 +46,8 @@ A JSON object representing an RRset has the following structure::
             "127.0.0.1",
             "127.0.0.2"
         ],
-        "ttl": 3600
+        "ttl": 3600,
+        "touched": "2020-04-06T09:24:09.987436Z"
     }
 
 Field details:
@@ -70,7 +74,7 @@ Field details:
     :Access mode: read-only
 
     The full DNS name of the RRset.  If ``subname`` is empty, this is equal to
-    ``:name.``, otherwise it is equal to ``:subname.:name.``.
+    ``{name}.``, otherwise it is equal to ``{subname}.{name}.``.
 
 ``records``
     :Access mode: read, write
@@ -86,16 +90,29 @@ Field details:
     The maximum number of array elements is 4091, and the maximum length of
     the array is 64,000 (after JSON encoding).
 
+    Records must be given in presentation format (a.k.a. "BIND" or zone file
+    format). Record values that are not given in canonical form, such as
+    ``0:0000::1`` will be converted by the API into canonical form, e.g.
+    ``::1``. Exact validation and canonicalization depend on the record
+    type.
+
 ``subname``
     :Access mode: read, write-once (upon RRset creation)
 
     Subdomain string which, together with ``domain``, defines the RRset name.
     Typical examples are ``www`` or ``_443._tcp``.  In general, a subname
-    consists of lowercase alphanumeric characters as well as hyphens ``-``, underscores
-    ``_``, and dots ``.``.  Wildcard name components are
+    consists of lowercase alphanumeric characters as well as hyphens ``-``,
+    underscores ``_``, and dots ``.``.  Wildcard name components are
     denoted by ``*``; this is allowed only once at the beginning of the name
     (see RFC 4592 for details).  The maximum length is 178.  Further
     restrictions may apply on a per-user basis.
+
+    Note that for subnames to be created, they must be explicitly stated.  In 
+    particular, the ``www`` name is not automatically created when assigning
+    an IP address to your domain name (by creating an ``A`` or ``AAAA``
+    record).  The same applies for the catch-all mechanism:  If you would like
+    a record to apply to all otherwise undefined subdomains, the wildcard
+    subdomain ``*`` must be explicitly given.
 
 ``ttl``
     :Access mode: read, write
@@ -115,14 +132,22 @@ Field details:
 
 .. _RRset types supported by PowerDNS: https://doc.powerdns.com/md/types/
 
+``touched``
+    :Access mode: read-only
+
+    Timestamp of when the RRset was last touched (same format as ``created``).
+    This field reflects the most recent write request to the RRset. It is also
+    updated when the write request does not actually change anything (e.g.
+    overwriting a DNS record with identical values).
+
 
 Creating an RRset
 ~~~~~~~~~~~~~~~~~
 
 To create a new RRset, simply issue a ``POST`` request to the
-``/api/v1/domains/:name/rrsets/`` endpoint, like this::
+``/api/v1/domains/{name}/rrsets/`` endpoint, like this::
 
-    curl -X POST https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X POST https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<< \
         '{"subname": "www", "type": "A", "ttl": 3600, "records": ["127.0.0.1", "127.0.0.2"]}'
@@ -153,7 +178,7 @@ A common use case is the creation of a ``TLSA`` RRset which carries information
 about the TLS certificate used by the server that the domain points to.  For
 example, to create a ``TLSA`` RRset for ``www.example.com``, you can run::
 
-    curl -X POST https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X POST https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         {
@@ -182,7 +207,7 @@ It is often desirable to create several RRsets at once.  This is achieved by
 sending an array of RRset objects to the ``rrsets/`` endpoint (instead of just
 one), like this::
 
-    curl -X POST https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X POST https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         [
@@ -201,11 +226,11 @@ For details about input validation and return status codes, please refer to
 Retrieving all RRsets in a Zone
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``/api/v1/domains/:name/rrsets/`` endpoint reponds to ``GET`` requests
+The ``/api/v1/domains/{name}/rrsets/`` endpoint reponds to ``GET`` requests
 with an array of `RRset object`_\ s. For example, you may issue the following
 command::
 
-    curl -X GET https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X GET https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}"
 
 to retrieve the contents of a zone that you own.  RRsets are returned in
@@ -226,9 +251,9 @@ can be retrieved by sending an empty pagination parameter, ``cursor=``.
 Once in pagination mode, the URLs to retrieve the next (or previous) page are
 given in the ``Link:`` response header.  For example::
 
-    Link: <https://desec.io/api/v1/domains/:domain/rrsets/?cursor=>; rel="first",
-      <https://desec.io/api/v1/domains/:domain/rrsets/?cursor=:prev_cursor>; rel="prev",
-      <https://desec.io/api/v1/domains/:domain/rrsets/?cursor=:next_cursor>; rel="next"
+    Link: <https://desec.io/api/v1/domains/{domain}/rrsets/?cursor=>; rel="first",
+      <https://desec.io/api/v1/domains/{domain}/rrsets/?cursor=:prev_cursor>; rel="prev",
+      <https://desec.io/api/v1/domains/{domain}/rrsets/?cursor=:next_cursor>; rel="next"
 
 where ``:prev_cursor`` and ``:next_cursor`` are page identifiers that are to
 be treated opaque by clients.  On the first/last page, the ``Link:`` header
@@ -246,7 +271,7 @@ To retrieve an array of all RRsets from your zone that have a specific type
 ``GET`` request with a ``type`` query parameter carrying the desired RRset type
 like::
 
-    curl https://desec.io/api/v1/domains/:name/rrsets/?type=:type \
+    curl https://desec.io/api/v1/domains/{name}/rrsets/?type={type} \
         --header "Authorization: Token {token}"
 
 Query parameters used for filtering are fully compatible with `pagination`_.
@@ -259,7 +284,7 @@ To filter the RRsets array by subname (e.g. to retrieve all records in the
 ``www`` subdomain, regardless of their type), use the ``subname`` query
 parameter, like this::
 
-    curl https://desec.io/api/v1/domains/:name/rrsets/?subname=:subname \
+    curl https://desec.io/api/v1/domains/{name}/rrsets/?subname={subname} \
         --header "Authorization: Token {token}"
 
 This approach also allows to retrieve all records associated with the zone
@@ -277,7 +302,7 @@ To retrieve an RRset with a specific name and type from your zone (e.g. the
 ``subname`` information and the type appended to the ``rrsets/`` endpoint,
 like this::
 
-    curl https://desec.io/api/v1/domains/:name/rrsets/:subname/:type/ \
+    curl https://desec.io/api/v1/domains/{name}/rrsets/{subname}/{type}/ \
         --header "Authorization: Token {token}"
 
 This will return only one RRset (i.e., the response is not a JSON array).  The
@@ -288,7 +313,7 @@ Accessing the Zone Apex
 ```````````````````````
 
 **Note:** The RRset at the zone apex (the domain root with an empty subname)
-*cannot* be queried via ``/api/v1/domains/:name/rrsets//:type/``.  This is due
+*cannot* be queried via ``/api/v1/domains/{name}/rrsets//{type}/``.  This is due
 to normalization rules of the HTTP specification which cause the double-slash
 ``//`` to be replaced with a single slash ``/``, breaking the URL structure.
 
@@ -297,13 +322,13 @@ value ``@``.  This is a common placeholder for this use case (see RFC 1035).
 As an example, you can retrieve the IPv4 address(es) of your domain root by
 running::
 
-    curl https://desec.io/api/v1/domains/:name/rrsets/@/A/ \
+    curl https://desec.io/api/v1/domains/{name}/rrsets/@/A/ \
         --header "Authorization: Token {token}"
 
 **Pro tip:** If you like to have the convenience of simple string expansion
-in the URL, you can add three dots after ``:subname``, like so::
+in the URL, you can add three dots after ``{subname}``, like so::
 
-    curl https://desec.io/api/v1/domains/:name/rrsets/:subname.../:type/ \
+    curl https://desec.io/api/v1/domains/{name}/rrsets/{subname}.../{type}/ \
         --header "Authorization: Token {token}"
 
 With this syntax, the above-mentioned normalization problem does not occur,
@@ -321,24 +346,28 @@ need to be provided.  In contrast, if you use ``PUT``, the full resource must
 be specified (that is, all fields, including ``subname`` and ``type``).
 Examples::
 
-    curl -X PUT https://desec.io/api/v1/domains/:name/rrsets/:subname/:type/ \
+    curl -X PUT https://desec.io/api/v1/domains/{name}/rrsets/{subname}/{type}/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         {
-          "subname": ":subname",
-          "type": ":type",
+          "subname": "{subname}",
+          "type": "{type}",
           "ttl": 3600,
           "records": ["..."]
         }
     EOF
 
-    curl -X PATCH https://desec.io/api/v1/domains/:name/rrsets/:subname/:type/ \
+    curl -X PATCH https://desec.io/api/v1/domains/{name}/rrsets/{subname}/{type}/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<< \
         '{"ttl": 86400}'
 
 If the RRset was updated successfully, the API returns ``200 OK`` with the
-updated RRset in the response body.  If the operation cannot be performed with
+updated RRset in the response body.  An exception to this rule is when an
+empty array is provided as the ``records`` field, in which case the RRset is
+deleted and the return code is ``204 No Content`` (cf. `Deleting an RRset`_).
+
+In case the operation cannot be performed with
 the given parameters, the API returns ``400 Bad Request``.  This can happen, for
 instance, when there is a conflicting RRset with the same name and type, when
 not all required fields were provided correctly (such as, when the ``type``
@@ -356,7 +385,7 @@ It is sometimes desirable to modify several RRsets at once.  This is achieved
 by sending an array of RRset objects to the ``rrsets/`` endpoint (instead of
 just one), like this::
 
-    curl -X PUT https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X PUT https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         [
@@ -391,7 +420,7 @@ It is sometimes desirable to delete an RRset while creating or modifying
 another one.  This is achieved by sending a bulk request with an RRset that
 has an empty records list ``[]``, using the ``PATCH`` or ``PUT`` method::
 
-    curl -X PATCH https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X PATCH https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         [
@@ -411,7 +440,7 @@ The ``rrsets/`` endpoint supports bulk operations via the ``POST``, ``PATCH``,
 and ``PUT`` request methods. You can simply send an array of RRset objects
 (instead of just one), like this::
 
-    curl -X PATCH https://desec.io/api/v1/domains/:name/rrsets/ \
+    curl -X PATCH https://desec.io/api/v1/domains/{name}/rrsets/ \
         --header "Authorization: Token {token}" \
         --header "Content-Type: application/json" --data @- <<EOF
         [
@@ -454,31 +483,27 @@ records to ``[]``.
 
 Input validation
 ````````````````
-There are two stages of input validation:
+The API performs various types of validation checks:
 
-1. Sanity checks, such as syntax, basic semantics (e.g. negative TTL), and
-   uniqueness checks. (We both check for uniqueness with respect to
-   pre-existing RRsets as well as with respect to other RRsets sent in the
-   same bulk request.)
+- Sanity checks, such as syntax, basic semantics (e.g. negative TTL).
 
-2. DNS conformity checks, such as whether the given type is a supported record
-   type, and whether the given record contents are consistent with the type.
+- RRset uniqueness (with respect to subname and type) and ``CNAME``
+  exclusivity.  We both check with respect to pre-existing RRsets as well as
+  with respect to other RRsets sent in the same request.
 
-If an error occurs in the first validation stage, the request is aborted, and
-the error(s) are returned.  Only if no error occurred, will the request be
-allowed to proceed to the second stage.
+- DNS record checks, such as whether the given type is a supported record
+  type, and whether the given record contents are consistent with the type.
 
-In the first stage, errors are presented as a list of errors, with each list
-item referring to one part of the bulk request, in the same order.  Parts that
-did not cause errors have an empty error object ``{}``, and parts with errors
-contain more details describing the error.  Unfortunately, in step 2, the API
-currently does not associate the error message with the RRset that caused it.
+Error responses have status ``400 Bad Request`` and contain a list of errors
+in the response body, with each list item corresponding to one part of the
+bulk request, in the same order.  Parts that passed without errors have an
+empty error object ``{}``, and parts with errors contain a data structure
+giving explaining the error(s) in a more detailed fashion.
 
-The successive treatment of stages means that one bulk part with a stage-2
-error may appear valid (``{}``) as long as another RRset has a stage-1 error.
-Only after the stage-1 error is resolved, the request will reach stage 2, at
-which point an error may appear due to a bulk part that previously seemed
-valid.
+In case of several errors for the same RRset, we sometimes only return one
+of them.  For example, if you're creating an RRset that conflicts with an
+existing RRset, the API does not perform further validation of the record
+contents, and instead only points out the uniqueness conflict.
 
 
 Notes
@@ -514,16 +539,21 @@ Restricted Types
     These record types are used very rarely in the wild.  Due to conflicts with
     the security guarantees we would like to give, these record types are
     disabled in our API.  If you attempt to create such RRsets, you will receive
-    a ``400 Bad Request`` response.  In case you have a good reason for using
-    these record types, shoot us an email and we can discuss your case.
+    a ``400 Bad Request`` response.
 
-``DNSKEY``, ``NSEC3PARAM``, ``RRSIG``
+``DNSKEY``, ``DS``, ``CDNSKEY``, ``CDS``, ``NSEC3PARAM``, ``RRSIG``
     These record types are meant to provide DNSSEC-related information in
     order to secure the data stored in your zones.  RRsets of this type are
-    generated and served automatically by our nameservers.  However, you can
-    neither read nor manipulate these RRsets through the API.  When attempting
-    such operations, ``403 Forbidden`` or ``400 Bad Request`` is returned,
-    respectively.
+    generated and served automatically by our nameservers.  It is currently
+    not possible to read or manipulate any automatically generated values
+    using the API.
+
+    Note, however, that it is possible to add *additional* values for some
+    key-related records types (``DNSKEY``, ``DS``, ``CDNSKEY``) in order to
+    publish extra public keys.  For details, see `DNSKEY caveat`_.
+
+    When attempting an unsupported operation, ``403 Forbidden`` or ``400 Bad
+    Request`` is returned.
 
 .. _`SOA caveat`:
 
@@ -556,29 +586,43 @@ Record types with priority field
     content, separated from the rest of it by a space (e.g.
     ``10 mx.example.com.``).
 
+.. _`DNSKEY caveat`:
+
+``CDNSKEY``, ``CDS``, ``DNSKEY`` record
+    These records are managed automatically by deSEC.  However, our API allows
+    adding additional values for specialized purposes.  Regular, automatic
+    DNSSEC operation does not require deSEC users to touch these records.
+
+    Using these record types inappropriately may break proper functioning of
+    your domain.  If you know what you're doing, you can use these record
+    types for announcing extra DNSSEC public keys, for example in order to
+    orchestrate keys when your zone is signed by several DNSSEC operators
+    independently ("multi-signer setup", see also RFC 8901).
+
+    **Note:** Manually provided records are published **in addition** to the
+    ones managed automatically by deSEC.  As a consequence, the TTL values of
+    extra records configured at the zone apex are ignored by the API, and
+    manually provided records are published with the same TTL as automatic
+    ones.
+
 ``CNAME`` record
-    - The record value must be terminated by a dot ``.`` (as in
-      ``example.com.``).
+    - The record value (target) must be terminated by a dot ``.`` (as in
+      ``example.com.``).  Only one value is allowed.
 
-    - If you create a ``CNAME`` record, its presence will cause other RRsets of
-      the same name to be hidden ("occluded") from the public (i.e. in
-      responses to DNS queries).  This is per RFC 1912.
+    - A ``CNAME`` record is not allowed when other records exist at the same
+      subname.  This is a limitation of the DNS specification.
 
-      However, as far as the API is concerned, you can still retrieve and
-      manipulate those additional RRsets.  In other words, ``CNAME``-induced
-      hiding of additional RRsets does not apply when looking at the zone
-      through the API.
+    - Due to the previous limitation, a CNAME is not allowed at the zone apex
+      (empty subname), as it would always collide with the NS record (and the
+      internally managed SOA record).
 
-    - It is currently possible to create a ``CNAME`` RRset with several
-      records.  However, this is not legal, and the response to queries for
-      such RRsets is undefined.  In short, don't do it.
+      If you need redirect functionality at the zone apex, consider using the
+      ``HTTPS`` record type which serves exactly this purpose. Although new,
+      browser vendor support is under way (with Chrome planning to roll out
+      experimental support in February 2021).
 
-    - Similarly, you are discouraged from creating a ``CNAME`` RRset for the
-      zone apex (main domain name, empty ``subname``).  Doing so will most
-      likely break your domain (for example, any ``NS`` records that are
-      present will disappear from DNS responses), and other undefined behavior
-      may occur.  In short, don't do it.  If you are interested in aliasing
-      the zone apex, consider using an ``ALIAS`` RRset.
+``DNSKEY`` record
+    See notes on the ``CDNSKEY``, ``CDS``, and ``DNSKEY`` record types.
 
 ``MX`` record
     The ``MX`` record value consists of the priority value and a mail server
@@ -600,7 +644,16 @@ Record types with priority field
     as required by the client you are using.  Here's an example of how to
     create a ``TXT`` RRset::
 
-        curl -X POST https://desec.io/api/v1/domains/:name/rrsets/ \
+        curl -X POST https://desec.io/api/v1/domains/{name}/rrsets/ \
             --header "Authorization: Token {token}" \
             --header "Content-Type: application/json" --data @- <<< \
             '{"type": "TXT", "records": ["\"test value1\"","\"value2\""], "ttl": 3600}'
+
+    Binary record contents are supported, but subject to various escaping
+    rules (both JSON and ``TXT`` record syntax; in addition, certain
+    non-printable characters are not accepted even when unicode-escaped, like
+    ``\u0000``).  Still, you can store any binary data by using DNS-style
+    ``\DDD`` encoding for your binary data (see RFC 1035 Sec. 3.3.14 and 5.1).
+    For example, a carriage return (``\r``) can be stored as ``\013``.  (Note
+    that JSON encoding needs to be applied on top of that, so a valid
+    ``records`` field would be ``["\"\\013\""]``.)

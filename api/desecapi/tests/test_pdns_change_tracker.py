@@ -19,10 +19,16 @@ class PdnsChangeTrackerTestCase(DesecTestCase):
         cls.full_domain = Domain.objects.create(owner=cls.user, name=cls.random_domain_name())
 
     def assertPdnsZoneUpdate(self, name, rr_sets):
-        return self.assertPdnsRequests([
-            self.request_pdns_zone_update_assert_body(name, rr_sets),
-            self.request_pdns_zone_axfr(name),
-        ])
+        def _assert_replication():
+            self.assertReplication(name)
+
+        return self.assertPdnsRequests(
+            [
+                self.request_pdns_zone_update_assert_body(name, rr_sets),
+                self.request_pdns_zone_axfr(name),
+            ],
+            exit_hook=_assert_replication,
+        )
 
     def test_rrset_does_not_exist_exception(self):
         tracker = PDNSChangeTracker()
@@ -75,8 +81,9 @@ class RRTestCase(PdnsChangeTrackerTestCase):
             RR(content=self.CONTENT_VALUES[1], rrset=self.simple_rr_set).save()
 
     def test_create_in_full_rr_set(self):
-        with self.assertPdnsFullRRSetUpdate(), PDNSChangeTracker():
-            RR(content=self.ALT_CONTENT_VALUES, rrset=self.full_rr_set).save()
+        for content in self.ALT_CONTENT_VALUES:
+            with self.assertPdnsFullRRSetUpdate(), PDNSChangeTracker():
+                RR(content=content, rrset=self.full_rr_set).save()
 
     def test_create_multiple_in_empty_rr_set(self):
         with self.assertPdnsEmptyRRSetUpdate(), PDNSChangeTracker():
@@ -268,8 +275,8 @@ class TXTRRTestCase(RRTestCase):
     TYPE = 'TXT'
     TTL = 876
     CONTENT_VALUES = ['"The quick brown fox jumps over the lazy dog"',
-                      '"main( ) {printf(\"hello, world\n\");}"',
-                      '“红色联合”对“四·二八兵团”总部大楼的攻击已持续了两天"']
+                      '"main( ) {printf(\\"hello, world\\010\\");}"',
+                      '"“红色联合”对“四·二八兵团”总部大楼的攻击已持续了两天"']
     ALT_CONTENT_VALUES = ['"🧥 👚 👕 👖 👔 👗 👙 👘 👠 👡 👢 👞 👟 🥾 🥿 🧦 🧤 🧣 🎩 🧢 👒 🎓 ⛑ 👑 👝 👛 👜 💼 🎒 👓 🕶 🥽 🥼 🌂 🧵"',
                           '"v=spf1 ip4:192.0.2.0/24 ip4:198.51.100.123 a -all"',
                           '"https://en.wikipedia.org/wiki/Domain_Name_System"']
@@ -278,7 +285,7 @@ class TXTRRTestCase(RRTestCase):
 class RRSetTestCase(PdnsChangeTrackerTestCase):
     TEST_DATA = {
         ('A', '_asdf', 123): ['1.2.3.4', '5.5.5.5'],
-        ('TXT', 'test', 455): ['ASDF', 'foobar', '92847'],
+        ('TXT', 'test', 455): ['"ASDF"', '"foobar"', '"92847"'],
         ('A', 'foo', 1010): ['1.2.3.4', '5.5.4.5'],
         ('AAAA', '*', 100023): ['::1', '::2', '::3', '::4'],
     }
@@ -455,6 +462,7 @@ class DomainTestCase(PdnsChangeTrackerTestCase):
         self.domains = []
 
     def setUp(self):
+        super().setUp()
         self.empty_domain = Domain.objects.create(name=self.random_domain_name(), owner=self.user)
         self.simple_domain = Domain.objects.create(name=self.random_domain_name(), owner=self.user)
         self.full_domain = Domain.objects.create(name=self.random_domain_name(), owner=self.user)
@@ -497,12 +505,12 @@ class DomainTestCase(PdnsChangeTrackerTestCase):
 
     def test_delete_single(self):
         for domain in self.domains:
-            with self.assertPdnsRequests(self.requests_desec_domain_deletion(domain.name)), PDNSChangeTracker():
+            with self.assertPdnsRequests(self.requests_desec_domain_deletion(domain)), PDNSChangeTracker():
                 domain.delete()
 
     def test_delete_multiple(self):
         with self.assertPdnsRequests([
-            self.requests_desec_domain_deletion(domain.name) for domain in reversed(self.domains)
+            self.requests_desec_domain_deletion(domain) for domain in reversed(self.domains)
         ], expect_order=False), PDNSChangeTracker():
             for domain in self.domains:
                 domain.delete()

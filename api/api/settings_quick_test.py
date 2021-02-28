@@ -1,14 +1,15 @@
+import os
+
 # noinspection PyUnresolvedReferences
 from api.settings import *
 
 # noinspection PyUnresolvedReferences
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': 'desecapi.sqlite',
-        'TEST': {
-            'CHARSET': 'utf8mb4',
-        },
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'desec',
+        'USER': 'desec',
+        'HOST': '127.0.0.1' if os.environ.get('DESECSTACK_DJANGO_TEST', '') == '1' else 'dbapi',
     },
 }
 
@@ -25,7 +26,8 @@ CACHES = {
 }
 
 REST_FRAMEWORK['PAGE_SIZE'] = 20
-REST_FRAMEWORK['DEFAULT_THROTTLE_CLASSES'] = []
+REST_FRAMEWORK['DEFAULT_THROTTLE_CLASSES'] = ['rest_framework.throttling.UserRateThrottle']
+REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {'user': '1000/s'}
 
 # Carry email backend connection over to test mail outbox
 CELERY_EMAIL_MESSAGE_EXTRA_ATTRIBUTES = ['connection']

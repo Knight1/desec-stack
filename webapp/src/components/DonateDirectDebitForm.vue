@@ -101,7 +101,6 @@
 <script>
   import axios from 'axios';
   import {email_pattern} from '../validation';
-  import {DESECSTACK_API_SEPA_CREDITOR_ID, DESECSTACK_API_SEPA_CREDITOR_NAME} from "../env";
 
   const HTTP = axios.create({
     baseURL: '/api/v1/',
@@ -118,8 +117,8 @@
       errors: [],
 
       /* from env */
-      creditorid: DESECSTACK_API_SEPA_CREDITOR_ID,
-      creditorname: DESECSTACK_API_SEPA_CREDITOR_NAME,
+      creditorid: process.env.VUE_APP_DESECSTACK_API_SEPA_CREDITOR_ID,
+      creditorname: process.env.VUE_APP_DESECSTACK_API_SEPA_CREDITOR_NAME,
 
       /* account holder name field */
       name: '',
@@ -191,7 +190,7 @@
               }
             } else {
               // 5xx
-              this.errors = ['Something went wrong at the server, but we currently do not know why. The customer support was already notified.'];
+              this.errors = ['Something went wrong at the server, but we currently do not know why. The support was already notified.'];
             }
           } else if (error.request) {
             this.errors = ['Cannot contact our servers. Are you offline?'];

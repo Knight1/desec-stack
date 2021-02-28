@@ -24,12 +24,12 @@
             <v-alert :value="!!(errors && errors.length)" type="error">
               <div v-if="errors.length > 1">
                 <li v-for="error of errors" :key="error.message" >
-                  <b>Error: {{ error.message }}</b>
+                  <b>{{ error.message }}</b>
                   {{ error }}
                 </li>
               </div>
-              <div v-else>
-                Error: {{ errors[0] }}
+              <div v-else-if="errors.length == 1">
+                {{ errors[0].detail || errors[0][0] || errors[0]}}
               </div>
             </v-alert>
             <v-form @submit.prevent="confirm" class="mb-4" v-model="valid" ref="form">
@@ -41,6 +41,7 @@
                       :working="this.working"
                       ref="actionHandler"
                       @autosubmit="confirm"
+                      @clearerrors="clearErrors"
               ></div>
             </v-form>
             <h2 class="title">Keep deSEC Going</h2>
@@ -69,8 +70,7 @@
 
   const HTTP = axios.create({
     baseURL: '/api/v1/',
-    headers: {
-    },
+    headers: {'Content-Type': 'application/json'},
   });
 
   export default {
@@ -95,6 +95,7 @@
     },
     methods: {
       async confirm() {
+        this.post_response = {}
         this.errors = []
         this.working = true
         let action = this.$route.params.action
@@ -107,6 +108,9 @@
         }
         this.working = false
       },
+      clearErrors() {
+        this.errors = []
+      }
     },
     filters: {
       replace: function (value, a, b) {

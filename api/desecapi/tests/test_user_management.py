@@ -11,7 +11,10 @@ This involves testing five separate endpoints:
 (3) Change email address endpoint,
 (4) delete user endpoint, and
 (5) verify endpoint.
+
+Furthermore, domain renewals and unused domain/account scavenging are tested.
 """
+from datetime import timedelta
 import random
 import re
 import time
@@ -20,7 +23,9 @@ from urllib.parse import urlparse
 
 from django.contrib.auth.hashers import is_password_usable
 from django.core import mail
+from django.core.management import call_command
 from django.urls import resolve
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.reverse import reverse
 from rest_framework.test import APIClient
@@ -28,16 +33,22 @@ from rest_framework.test import APIClient
 from api import settings
 from desecapi.models import Domain, User, Captcha
 from desecapi.serializers import AuthenticatedActionSerializer
-from desecapi.tests.base import DesecTestCase, PublicSuffixMockMixin
+from desecapi.tests.base import DesecTestCase, DomainOwnerTestCase, PublicSuffixMockMixin
 
 
 class UserManagementClient(APIClient):
 
-    def register(self, email, password, captcha_id, captcha_solution, **kwargs):
+    def register(self, email, password, captcha=None, **kwargs):
+        try:
+            captcha_id, captcha_solution = captcha
+        except TypeError:
+            pass
+        else:
+            kwargs['captcha'] = {'id': captcha_id, 'solution': captcha_solution}
+
         return self.post(reverse('v1:register'), {
             'email': email,
             'password': password,
-            'captcha': {'id': captcha_id, 'solution': captcha_solution},
             **kwargs
         })
 
@@ -93,15 +104,13 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
         solution = Captcha.objects.get(id=id).content
         return id, solution
 
-    def register_user(self, email=None, password=None, **kwargs):
+    def register_user(self, email=None, password=None, late_captcha=False, **kwargs):
         email = email if email is not None else self.random_username()
-        captcha_id, captcha_solution = self.get_captcha()
-        return email.strip(), password, self.client.register(email, password, captcha_id, captcha_solution, **kwargs)
+        captcha = None if late_captcha else self.get_captcha()
+        return email.strip(), password, self.client.register(email, password, captcha, **kwargs)
 
     def login_user(self, email, password):
-        response = self.client.login_user(email, password)
-        token = response.data.get('token')
-        return token, response
+        return self.client.login_user(email, password)
 
     def logout(self, token):
         return self.client.logout(token)
@@ -144,7 +153,7 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
         self.assertFalse(mail.outbox, "Expected no email to be sent, but %i were sent. First subject line is '%s'." %
                          (len(mail.outbox), mail.outbox[0].subject if mail.outbox else '<n/a>'))
 
-    def assertEmailSent(self, subject_contains='', body_contains='', recipient=None, reset=True, pattern=None):
+    def assertEmailSent(self, subject_contains='', body_contains=None, recipient=None, reset=True, pattern=None):
         total = 1
         self.assertEqual(len(mail.outbox), total, "Expected %i message in the outbox, but found %i." %
                          (total, len(mail.outbox)))
@@ -152,9 +161,9 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
         self.assertTrue(subject_contains in email.subject,
                         "Expected '%s' in the email subject, but found '%s'" %
                         (subject_contains, email.subject))
-        self.assertTrue(body_contains in email.body,
-                        "Expected '%s' in the email body, but found '%s'" %
-                        (body_contains, email.body))
+        if type(body_contains) != list: body_contains = [] if body_contains is None else [body_contains]
+        for elem in body_contains:
+            self.assertTrue(elem in email.body, f"Expected '{elem}' in the email body, but found '{email.body}'")
         if recipient is not None:
             if isinstance(recipient, list):
                 self.assertListEqual(recipient, email.recipients())
@@ -253,7 +262,7 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
     def assertRegistrationFailureDomainUnavailableResponse(self, response, domain):
         self.assertContains(
             response=response,
-            text='This domain name is unavailable',
+            text='This domain name conflicts with an existing zone, or is disallowed by policy.',
             status_code=status.HTTP_400_BAD_REQUEST,
             msg_prefix=str(response.data)
         )
@@ -261,7 +270,7 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
     def assertRegistrationFailureDomainInvalidResponse(self, response, domain):
         self.assertContains(
             response=response,
-            text="Invalid value (not a DNS name)",
+            text="Domain names must be labels separated by dots. Labels",
             status_code=status.HTTP_400_BAD_REQUEST,
             msg_prefix=str(response.data)
         )
@@ -280,6 +289,10 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
             text="Success!",
             status_code=status.HTTP_200_OK
         )
+
+    def assertRegistrationVerificationFailureResponse(self, response):
+        self.assertEqual(response.data['captcha'][0], "This field is required.")
+        self.assertStatus(response, status.HTTP_400_BAD_REQUEST)
 
     def assertRegistrationWithDomainVerificationSuccessResponse(self, response, domain=None, email=None):
         self.assertNoEmailSent()  # do not send email in any case
@@ -372,14 +385,14 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
     def assertVerificationFailureInvalidCodeResponse(self, response):
         return self.assertContains(
             response=response,
-            text="Invalid code.",
-            status_code=status.HTTP_400_BAD_REQUEST
+            text="This action cannot be carried out because another operation has been performed",
+            status_code=status.HTTP_409_CONFLICT
         )
 
     def assertVerificationFailureExpiredCodeResponse(self, response):
         return self.assertContains(
             response=response,
-            text="Invalid code.",
+            text="This code is invalid, possibly because it expired (validity: ",
             status_code=status.HTTP_400_BAD_REQUEST
         )
 
@@ -390,16 +403,24 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
             status_code=status.HTTP_400_BAD_REQUEST
         )
 
-    def _test_registration(self, email=None, password=None, **kwargs):
-        email, password, response = self.register_user(email, password, **kwargs)
+    def _test_registration(self, email=None, password=None, late_captcha=True, **kwargs):
+        email, password, response = self.register_user(email, password, late_captcha, **kwargs)
         self.assertRegistrationSuccessResponse(response)
         self.assertUserExists(email)
         self.assertFalse(User.objects.get(email=email).is_active)
+        self.assertEqual(User.objects.get(email=email).needs_captcha, late_captcha)
         self.assertPassword(email, password)
         confirmation_link = self.assertRegistrationEmail(email)
         self.assertConfirmationLinkRedirect(confirmation_link)
-        self.assertRegistrationVerificationSuccessResponse(self.client.verify(confirmation_link))
+        response = self.client.verify(confirmation_link)
+        if late_captcha:
+            self.assertRegistrationVerificationFailureResponse(response)
+            captcha_id, captcha_solution = self.get_captcha()
+            data = {'captcha': {'id': captcha_id, 'solution': captcha_solution}}
+            response = self.client.verify(confirmation_link, data=data)
+        self.assertRegistrationVerificationSuccessResponse(response)
         self.assertTrue(User.objects.get(email=email).is_active)
+        self.assertFalse(User.objects.get(email=email).needs_captcha)
         self.assertPassword(email, password)
         return email, password
 
@@ -422,7 +443,7 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
         if tampered_domain is not None:
             path = urlparse(confirmation_link).path
             code = resolve(path).kwargs.get('code')
-            data = AuthenticatedActionSerializer._unpack_code(code)
+            data = AuthenticatedActionSerializer._unpack_code(code, ttl=None)
             data['domain'] = tampered_domain
             tampered_code = AuthenticatedActionSerializer._pack_code(data)
             confirmation_link = confirmation_link.replace(code, tampered_code)
@@ -443,9 +464,11 @@ class UserManagementTestCase(DesecTestCase, PublicSuffixMockMixin):
         return email, password, domain
 
     def _test_login(self):
-        token, response = self.login_user(self.email, self.password)
+        response = self.login_user(self.email, self.password)
         self.assertLoginSuccessResponse(response)
-        return token
+        self.assertEqual(response.data['max_age'], '7 00:00:00')
+        self.assertEqual(response.data['max_unused_period'], '01:00:00')
+        return response.data['token']
 
     def _test_logout(self):
         response = self.logout(self.token)
@@ -500,6 +523,11 @@ class NoUserAccountTestCase(UserLifeCycleTestCase):
 
     def test_home(self):
         self.assertResponse(self.client.get(reverse('v1:root')), status.HTTP_200_OK)
+
+    def test_authenticated_action_redirect_with_invalid_code(self):
+        # This tests that the code is not processed when Accept: text/html is not set (redirect without further ado)
+        confirmation_link = self.reverse('v1:confirm-activate-account', code='foobar')
+        self.assertConfirmationLinkRedirect(confirmation_link)
 
     def test_registration(self):
         self._test_registration(password=self.random_password())
@@ -575,8 +603,11 @@ class NoUserAccountTestCase(UserLifeCycleTestCase):
         password = self.random_password()
         captcha_id, _ = self.get_captcha()
         self.assertRegistrationFailureCaptchaInvalidResponse(
-            self.client.register(email, password, captcha_id, 'this is most definitely not a correct CAPTCHA solution')
+            self.client.register(email, password, (captcha_id, 'this is most definitely not a CAPTCHA solution'))
         )
+
+    def test_registration_late_captcha(self):
+        self._test_registration(password=self.random_password(), late_captcha=True)
 
 
 class OtherUserAccountTestCase(UserManagementTestCase):
@@ -870,3 +901,188 @@ class HasUserAccountTestCase(UserManagementTestCase):
         self.assertVerificationFailureInvalidCodeResponse(self.client.verify(delete_link))
         self.assertVerificationFailureInvalidCodeResponse(self.client.verify(reset_password_link,
                                                                              data={'new_password': 'dummy'}))
+
+
+class RenewTestCase(UserManagementTestCase, DomainOwnerTestCase):
+    DYN = False
+
+    def setUp(self):
+        super().setUp()
+        self.email, self.password = self._test_registration(password=self.random_password())
+
+    def assertRenewDomainEmail(self, recipient, body_contains, pattern, reset=True):
+        return self.assertEmailSent(
+            subject_contains='Upcoming domain deletion',
+            body_contains=body_contains,
+            recipient=[recipient],
+            reset=reset,
+            pattern=pattern,
+        )
+
+    def assertRenewDomainVerificationSuccessResponse(self, response):
+        return self.assertContains(
+            response=response,
+            text='We recorded that your domain ',
+            status_code=status.HTTP_200_OK
+        )
+
+    def test_renew_domain_immortal(self):
+        domain = self.my_domains[0]
+        domain.renewal_state = Domain.RenewalState.IMMORTAL
+        domain.save()
+        for days in [182, 184]:
+            domain.published = timezone.now() - timedelta(days=days)
+            domain.renewal_changed = domain.published
+            domain.save()
+
+            call_command('scavenge-unused')
+            self.assertEqual(len(mail.outbox), 0)
+            self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.IMMORTAL)
+            self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_changed, domain.renewal_changed)
+            self.assertEqual(Domain.objects.get(pk=domain.pk).published, domain.published)
+
+    def test_renew_domain_recently_published(self):
+        domain = self.my_domains[0]
+        for days in [5, 182, 184]:
+            domain.published = timezone.now() - timedelta(days=1)
+            domain.renewal_changed = timezone.now() - timedelta(days=days)
+            domain.rrset_set.update(touched=domain.renewal_changed)
+            for renewal_state in [Domain.RenewalState.FRESH, Domain.RenewalState.NOTIFIED, Domain.RenewalState.WARNED]:
+                domain.renewal_state = renewal_state
+                domain.save()
+
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, domain.renewal_state)
+                call_command('scavenge-unused')
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_changed, domain.published)
+                self.assertEqual(Domain.objects.get(pk=domain.pk).published, domain.published)
+                self.assertEqual(len(mail.outbox), 0)
+
+    def test_renew_domain_recently_touched(self):
+        domain = self.my_domains[0]
+        last_active = timezone.now() - timedelta(days=1)
+        for days in [5, 182, 184]:
+            domain.published = timezone.now() - timedelta(days=days)
+            domain.renewal_changed = domain.published
+            domain.rrset_set.update(touched=last_active)
+            for renewal_state in [Domain.RenewalState.FRESH, Domain.RenewalState.NOTIFIED, Domain.RenewalState.WARNED]:
+                domain.renewal_state = renewal_state
+                domain.save()
+
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, domain.renewal_state)
+                call_command('scavenge-unused')
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+                self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_changed, last_active)
+                self.assertEqual(Domain.objects.get(pk=domain.pk).published, domain.published)
+                self.assertEqual(len(mail.outbox), 0)
+
+    def test_renew_domain_fresh_182_days(self):
+        domain = self.my_domains[0]
+        domain.published = timezone.now() - timedelta(days=182)
+        domain.renewal_changed = domain.published
+        domain.renewal_state = Domain.RenewalState.FRESH
+        domain.save()
+
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+        call_command('scavenge-unused')
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_renew_domain_fresh_183_days(self):
+        domain = self.my_domains[0]
+        domain.published = timezone.now() - timedelta(days=183)
+        domain.renewal_changed = domain.published
+        domain.renewal_state = Domain.RenewalState.FRESH
+        domain.save()
+        domain.rrset_set.update(touched=domain.published)
+
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+        call_command('scavenge-unused')
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.NOTIFIED)
+
+        deletion_date = timezone.localdate() + timedelta(days=28)
+        body_contains = [domain.name, deletion_date.strftime('%B %-d, %Y')]
+        pattern = r'following link[^:]*:\s+\* ' + domain.name.replace('.', r'\.') + r'\s+([^\s]*)'
+        confirmation_link = self.assertRenewDomainEmail(domain.owner.email, body_contains, pattern)
+        self.assertConfirmationLinkRedirect(confirmation_link)
+
+        # Use link after 14 days
+        with mock.patch('time.time', return_value=time.time() + 86400*14):
+            self.assertRenewDomainVerificationSuccessResponse(self.client.verify(confirmation_link))
+            self.assertLess(timezone.now() - Domain.objects.get(pk=domain.pk).renewal_changed, timedelta(seconds=1))
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+
+        # Check that other domains aren't affected
+        self.assertGreater(len(self.my_domains), 1)
+        for domain in self.my_domains[1:]:
+            self.assertLess(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.NOTIFIED)
+            self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_changed, domain.renewal_changed)
+
+    def test_renew_domain_notified_21_days(self):
+        domain = self.my_domains[0]
+        domain.published = timezone.now() - timedelta(days=183+21)
+        domain.renewal_state = Domain.RenewalState.NOTIFIED
+        domain.renewal_changed = timezone.now() - timedelta(days=21)
+        domain.save()
+        domain.rrset_set.update(touched=domain.published)
+
+        call_command('scavenge-unused')
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.WARNED)
+
+        deletion_date = timezone.localdate() + timedelta(days=7)
+        body_contains = [domain.name, deletion_date.strftime('%B %-d, %Y')]
+        pattern = r'following link[^:]*:\s+\* ' + domain.name.replace('.', r'\.') + r'\s+([^\s]*)'
+        confirmation_link = self.assertRenewDomainEmail(domain.owner.email, body_contains, pattern)
+        self.assertConfirmationLinkRedirect(confirmation_link)
+
+        # Use link after 6 days
+        with mock.patch('time.time', return_value=time.time() + 86400*6):
+            self.assertRenewDomainVerificationSuccessResponse(self.client.verify(confirmation_link))
+            self.assertLess(timezone.now() - Domain.objects.get(pk=domain.pk).renewal_changed, timedelta(seconds=1))
+        self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.FRESH)
+
+        # Check that other domains aren't affected
+        self.assertGreater(len(self.my_domains), 1)
+        for domain in self.my_domains[1:]:
+            self.assertLess(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.NOTIFIED)
+            self.assertEqual(Domain.objects.get(pk=domain.pk).renewal_changed, domain.renewal_changed)
+
+    def test_renew_domain_warned_7_days(self):
+        domains = self.my_domains[:]  # copy list so we can modify it later without side effects
+        self.assertGreaterEqual(len(domains), 2)
+        while domains:
+            domain = domains.pop()
+            domain.published = timezone.now() - timedelta(days=183+28)
+            domain.renewal_state = Domain.RenewalState.WARNED
+            domain.renewal_changed = timezone.now() - timedelta(days=7)
+            domain.save()
+            domain.rrset_set.update(touched=domain.published)
+
+            with self.assertPdnsRequests(self.requests_desec_domain_deletion(domain=domain)):
+                 call_command('scavenge-unused')
+            self.assertFalse(Domain.objects.filter(pk=domain.pk).exists())
+
+            # User gets deleted when last domain is purged
+            self.assertEqual(User.objects.filter(pk=self.owner.pk).exists(), bool(domains))
+
+            # Check that other domains are not affected
+            for domain in domains:
+                self.assertLess(Domain.objects.get(pk=domain.pk).renewal_state, Domain.RenewalState.NOTIFIED)
+
+
+class RenewDynTestCase(RenewTestCase):
+    DYN = True
+
+
+class RenewNoRRsetTestCase(RenewTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.my_domains[0].rrset_set.all().delete()
+
+    def test_renew_domain_recently_touched(self):
+        pass
+
+
+class RenewDynNoRRsetTestCase(RenewNoRRsetTestCase):
+    DYN = True

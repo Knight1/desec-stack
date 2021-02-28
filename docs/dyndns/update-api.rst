@@ -6,37 +6,64 @@ works.  We provide this API to be compatible with
 most dynDNS clients. However, we also provide a RESTful API that is
 more powerful and always preferred over the legacy interface described here.
 
+Please note that when using HTTPS (which we highly recommend), outdated setups
+(such as TLS < 1.2) are not supported.  If you encounter SSL/TLS handshake
+issues, you may have to update your dynDNS client and/or libraries used by it
+(such as OpenSSL).
+
+**Note:** Out of mercy for legacy clients (especially old routers), we still
+accept unencrypted requests for this service.  We **urge** you to **use HTTPS
+whenever possible**.
+
 Update Request
 ``````````````
-An IP updates is performed by sending a GET request to ``update.dedyn.io`` via
-HTTP or HTTPS. The path component can be chosen freely as long as it does not
-end in ``.ico`` or ``.png``.
+An IP updates is performed by sending a ``GET`` request to ``update.dedyn.io``
+via IPv4 or IPv6.  To enforce IPv6, use ``update6.dedyn.io``.  The path
+component can be chosen freely as long as it does not end in ``.ico`` or
+``.png``.  HTTPS is recommended over HTTP.
 
-You can connect via IPv4 or IPv6. To enforce IPv6, use ``update6.dedyn.io``.
+When the request is authenticated successfully, we use the connection IP
+address and query parameters to update your domain's DNS ``A`` (IPv4) and
+``AAAA`` (IPv6) records.  The new records will have a TTL value of 60 seconds
+(that is, outdated values should disappear from DNS resolvers within that
+time).
 
-Please be aware that while we still accept unencrypted requests, we **urge**
-you to use HTTPS. For that reason, we also send an HSTS header on HTTPS
-connections.
 
-Authentication
-**************
-You can authenticate your client in several ways:
+.. _update-api-authentication:
 
-- Preferred method: HTTP Basic Authentication. Encode your username and
-  password as provided upon registration in the ``Authorization: Basic ...``
-  header. This is the method virtually all dynDNS clients use out of the box.
+IP Update Authentication
+************************
 
-- REST API method: HTTP Token Authentication. Send an ``Authorization: Token
-  ...`` header along with your request, where ``...`` is an API token issued
-  for this purpose. This method is used by our REST API as well.
+You can authenticate your client in several ways. If authentication fails, the
+API will return a ``401 Unauthorized`` status code.
 
-- Set the ``username`` and ``password`` query string parameters (``GET
-  ?username=...&password=...``). We **strongly discourage** using this
-  method, but provide it as an emergency solution for situations where folks
-  need to deal with old and/or crappy clients.
+Preferred method: HTTP Basic Authentication (with token)
+--------------------------------------------------------
+Encode your username and token (provided during registration) in the
+``Authorization: Basic ...`` header. This is the method virtually all dynDNS
+clients use out of the box.
 
-If we cannot authenticate you, the API will return a ``401 Unauthorized``
-status code.
+**Important:** If you dynDNS client asks for a *password*, do not enter your
+account password (if you have one). Instead, enter your token!
+
+
+HTTP Token Authentication
+------------------------------------------
+Send an ``Authorization: Token  ...`` header along with your request, where
+``...`` is the token issued at registration (or manually created later).
+
+Query string method (discouraged)
+---------------------------------
+Set the ``username`` and ``password`` query string parameters (``GET
+?username=...&password=...``).
+
+**Important:** We **strongly discourage** using this method as it comes with a
+subtle disadvantage: We log all HTTP request URLs for a few days to facilitate
+debugging. As a consequence, this method will cause your secret token to end
+up in our log files in clear text. The method is provided as an emergency
+solution where folks need to deal with old and/or crappy clients. If this is
+the case, we suggest looking for another client.
+
 
 Determine Hostname
 ******************
@@ -56,11 +83,20 @@ determine the hostname, we try the following steps until there is a match:
 - After successful authentication (no matter how), the only hostname that is
   associated with your user account (if not ambiguous).
 
-If we cannot determine a hostname to update, the API will return a ``404 Not
-Found`` status code. If the selected hostname is not eligible for dynamic
-updates, we will return ``403 Forbidden``. This usually happens if you try
-updating a hostname that is not under the ``dedyn.io`` domain. If you are
-affected by this and would like to use another domain, please contact support.
+If we cannot determine a hostname to update, the API returns a status code of
+``400 Bad Request`` (if no hostname was given but multiple domains exist in
+the account) or ``404 Not Found`` (if the specified domain was not found).
+
+Subdomains
+----------
+The dynDNS update API can also be used to update IP records for subdomains.
+To do so, make sure that in the above list of steps, the first value
+provided contains the full domain name (including the subdomain).
+
+Example: Your domain is ``yourdomain.dedyn.io``, and you're using HTTP Basic
+Authentication.  In this case, replace your authentication username with
+``sub.yourdomain.dedyn.io``.  Similarly, if you use the ``hostname`` query
+parameter, it needs to be set to the full domain name (including subdomain).
 
 .. _determine-ip-addresses:
 
@@ -88,3 +124,39 @@ Update Response
 If successful, the server will return a response with status ``200 OK`` and
 ``good`` as the body (as per the dyndns2 protocol specification). For error
 status codes, see above.
+
+dynDNS updates are subject to rate limiting.  For details, see
+:ref:`rate-limits`.
+
+
+Examples
+````````
+The examples below use ``<your domain>.dedyn.io`` as the domain which is to be updated and
+``<your authorization token>`` as an API token affiliated with the respective account.
+(See :ref:`manage-tokens` for details.) ``1.2.3.4`` is used as an example for an IPv4 Address,
+``fd08::1234`` as a stand-in for an IPv6 address. Replace those (including the ``<`` and ``>``)
+with your respective values.
+
+
+Basic authentication with automatic IP detection (IPv4 **or** IPv6)::
+
+  curl --user <your domain>.dedyn.io:<your authorization token> https://update.dedyn.io/
+  
+  curl https://update.dedyn.io/?hostname=<your domain>.dedyn.io \
+    --header "Authorization: Token <your authorization token>"
+
+Basic authentication with forced use of IPv6 (will remove IPv4 address from the DNS)::
+
+  curl --user <your domain>.dedyn.io:<your authorization token> https://update6.dedyn.io/
+  
+  curl https://update6.dedyn.io/?hostname=<your domain>.dedyn.io \
+    --header "Authorization: Token <your authorization token>"
+
+Basic authentication with simultaneous update of IPv4 and IPv6::
+
+  curl --user <your domain>.dedyn.io:<your authorization token> \
+    "https://update.dedyn.io/?myipv4=1.2.3.4&myipv6=fd08::1234"
+
+  curl "https://update6.dedyn.io/?hostname=<your domain>.dedyn.io?myipv4=1.2.3.4&myipv6=fd08::1234" \
+    --header "Authorization: Token <your authorization token>"
+

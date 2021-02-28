@@ -17,7 +17,9 @@ from rest_framework.reverse import reverse
 from rest_framework.test import APITestCase, APIClient
 from rest_framework.utils import json
 
-from desecapi.models import User, Domain, Token, RRset, RR, psl
+from desecapi import replication
+from desecapi.models import User, Domain, Token, RRset, RR, psl, RR_SET_TYPES_AUTOMATIC, RR_SET_TYPES_UNSUPPORTED, \
+    RR_SET_TYPES_MANAGEABLE
 
 
 class DesecAPIClient(APIClient):
@@ -139,7 +141,8 @@ class AssertRequestsContextManager:
             else:
                 yield i
 
-    def __init__(self, test_case, expected_requests, single_expectation_single_request=True, expect_order=True):
+    def __init__(self, test_case, expected_requests, single_expectation_single_request=True, expect_order=True,
+                 exit_hook=None):
         """
         Initialize a context that checks for made HTTP requests.
 
@@ -157,10 +160,10 @@ class AssertRequestsContextManager:
         self.single_expectation_single_request = single_expectation_single_request
         self.expect_order = expect_order
         self.old_httpretty_entries = None
+        self.exit_hook = exit_hook
 
     def __enter__(self):
         hr_core.POTENTIAL_HTTP_PORTS.add(8081)  # FIXME should depend on self.expected_requests
-        self.expected_requests = self.expected_requests
         # noinspection PyProtectedMember
         self.old_httpretty_entries = httpretty._entries.copy()  # FIXME accessing private properties of httpretty
         for request in self.expected_requests:
@@ -170,13 +173,19 @@ class AssertRequestsContextManager:
     def _find_matching_request(pattern, requests):
         for request in requests:
             if pattern['method'] == request[0] and pattern['uri'].match(request[1]):
+                if pattern.get('payload') and pattern['payload'] not in request[2]:
+                    continue
                 return request
         return None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # call exit hook
+        if callable(self.exit_hook):
+            self.exit_hook()
+
         # organize seen requests in a primitive data structure
         seen_requests = [
-            (r.command, 'http://%s%s' % (r.headers['Host'], r.path)) for r in httpretty.latest_requests
+            (r.command, 'http://%s%s' % (r.headers['Host'], r.path), r.parsed_body) for r in httpretty.latest_requests
         ]
         httpretty.reset()
         hr_core.POTENTIAL_HTTP_PORTS.add(8081)  # FIXME should depend on self.expected_requests
@@ -289,13 +298,14 @@ class MockPDNSTestCase(APITestCase):
             return [x.rstrip('.') + '.' for x in arg]
 
     @classmethod
-    def request_pdns_zone_create(cls, ns):
+    def request_pdns_zone_create(cls, ns, **kwargs):
         return {
             'method': 'POST',
             'uri': cls.get_full_pdns_url(cls.PDNS_ZONES, ns=ns),
             'status': 201,
-            'body': None,
+            'body': '',
             'match_querystring': True,
+            **kwargs
         }
 
     def request_pdns_zone_create_assert_name(self, ns, name):
@@ -328,7 +338,7 @@ class MockPDNSTestCase(APITestCase):
             'method': 'DELETE',
             'uri': cls.get_full_pdns_url(cls.PDNS_ZONE, ns=ns, id=cls._pdns_zone_id_heuristic(name)),
             'status': 200,
-            'body': None,
+            'body': '',
         }
 
     @classmethod
@@ -337,40 +347,8 @@ class MockPDNSTestCase(APITestCase):
             'method': 'PATCH',
             'uri': cls.get_full_pdns_url(cls.PDNS_ZONE, id=cls._pdns_zone_id_heuristic(name)),
             'status': 200,
-            'body': None,
+            'body': '',
         }
-
-    @classmethod
-    def request_pdns_zone_update_unknown_type(cls, name=None, unknown_types=None):
-        def request_callback(r, _, response_headers):
-            body = json.loads(r.parsed_body)
-            if not unknown_types or body['rrsets'][0]['type'] in unknown_types:
-                return [
-                    422, response_headers,
-                    json.dumps({'error': 'Mocked error. Unknown RR type %s.' % body['rrsets'][0]['type']})
-                ]
-            else:
-                return [200, response_headers, None]
-
-        request = cls.request_pdns_zone_update(name)
-        # noinspection PyTypeChecker
-        request['body'] = request_callback
-        request.pop('status')
-        return request
-
-    @classmethod
-    def request_pdns_zone_update_invalid_rr(cls, name=None):
-        def request_callback(r, _, response_headers):
-            return [
-                422, response_headers,
-                json.dumps({'error': 'Mocked error. Considering RR content invalid.'})
-            ]
-
-        request = cls.request_pdns_zone_update(name)
-        # noinspection PyTypeChecker
-        request['body'] = request_callback
-        request.pop('status')
-        return request
 
     def request_pdns_zone_update_assert_body(self, name: str = None, updated_rr_sets: Union[List[RRset], Dict] = None):
         if updated_rr_sets is None:
@@ -457,7 +435,6 @@ class MockPDNSTestCase(APITestCase):
             'status': 200,
             'body': json.dumps([
                 {
-                    'active': True,
                     'algorithm': 'ECDSAP256SHA256',
                     'bits': 256,
                     'dnskey': '257 3 13 EVBcsqrnOp6RGWtsrr9QW8cUtt/'
@@ -471,6 +448,7 @@ class MockPDNSTestCase(APITestCase):
                     'flags': 257,
                     'id': 179425943,
                     'keytype': key_type,
+                    'published': True,
                     'type': 'Cryptokey',
                 }
                 for key_type in ['csk', 'ksk', 'zsk']
@@ -483,7 +461,7 @@ class MockPDNSTestCase(APITestCase):
             'method': 'PUT',
             'uri': cls.get_full_pdns_url(cls.PDNS_ZONE_AXFR, ns='MASTER', id=cls._pdns_zone_id_heuristic(name)),
             'status': 200,
-            'body': None,
+            'body': '',
         }
 
     @classmethod
@@ -492,22 +470,28 @@ class MockPDNSTestCase(APITestCase):
             'method': 'PATCH',
             'uri': cls.get_full_pdns_url(cls.PDNS_ZONE, ns='MASTER', id=cls._pdns_zone_id_heuristic('catalog.internal')),
             'status': 204,
-            'body': None,
+            'body': '',
             'priority': 1,  # avoid collision with DELETE zones/(?P<id>[^/]+)$ (httpretty does not match the method)
         }
 
-    def assertPdnsRequests(self, *expected_requests, expect_order=True):
+    def __init__(self, methodName: str = ...) -> None:
+        super().__init__(methodName)
+        self._mock_replication = None
+
+    def assertPdnsRequests(self, *expected_requests, expect_order=True, exit_hook=None):
         """
         Assert the given requests are made. To build requests, use the `MockPDNSTestCase.request_*` functions.
         Unmet expectations will fail the test.
         Args:
             *expected_requests: List of expected requests.
             expect_order: If True (default), the order of observed requests is checked.
+            exit_hook: If given a callable, it is called when the context manager exits.
         """
         return AssertRequestsContextManager(
             test_case=self,
             expected_requests=expected_requests,
             expect_order=expect_order,
+            exit_hook=exit_hook,
         )
 
     def assertPdnsNoRequestsBut(self, *expected_requests):
@@ -578,6 +562,9 @@ class MockPDNSTestCase(APITestCase):
                             for hashed in Token.objects.filter(user=user).values_list('key', flat=True)))
         self.assertEqual(len(Token.make_hash(plain).split('$')), 4)
 
+    def assertReplication(self, name):
+        replication.update.delay.assert_called_with(name)
+
     @classmethod
     def setUpTestData(cls):
         httpretty.enable(allow_net_connect=False)
@@ -609,6 +596,7 @@ class MockPDNSTestCase(APITestCase):
         httpretty.disable()
 
     def setUp(self):
+        # configure mocks for nslord
         def request_callback(r, _, response_headers):
             try:
                 request = json.loads(r.parsed_body)
@@ -647,6 +635,15 @@ class MockPDNSTestCase(APITestCase):
                     priority=-100,
                 )
 
+        # configure mocks for replication
+        self._mock_replication = mock.patch('desecapi.replication.update.delay', return_value=None, wraps=None)
+        self._mock_replication.start()
+
+    def tearDown(self) -> None:
+        if self._mock_replication:
+            self._mock_replication.stop()
+        super().tearDown()
+
 
 class DesecTestCase(MockPDNSTestCase):
     """
@@ -662,6 +659,9 @@ class DesecTestCase(MockPDNSTestCase):
     AUTO_DELEGATION_DOMAINS = settings.LOCAL_PUBLIC_SUFFIXES
     PUBLIC_SUFFIXES = {'de', 'com', 'io', 'gov.cd', 'edu.ec', 'xxx', 'pinb.gov.pl', 'valer.ostfold.no',
                        'kota.aichi.jp', 's3.amazonaws.com', 'wildcard.ck'}
+    SUPPORTED_RR_SET_TYPES = {'A', 'AAAA', 'AFSDB', 'APL', 'CAA', 'CDNSKEY', 'CDS', 'CERT', 'CNAME', 'DHCID', 'DNSKEY',
+                              'DLV', 'DS', 'EUI48', 'EUI64', 'HINFO', 'HTTPS', 'KX', 'LOC', 'MX', 'NAPTR', 'NS',
+                              'OPENPGPKEY', 'PTR', 'RP', 'SMIMEA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT', 'URI'}
 
     admin = None
     auto_delegation_domains = None
@@ -722,12 +722,12 @@ class DesecTestCase(MockPDNSTestCase):
     def create_token(cls, user, name=''):
         token = Token.objects.create(user=user, name=name)
         token.save()
-        return token.plain
+        return token
 
     @classmethod
-    def create_user(cls, **kwargs):
+    def create_user(cls, needs_captcha=False, **kwargs):
         kwargs.setdefault('email', cls.random_username())
-        user = User(**kwargs)
+        user = User(needs_captcha=needs_captcha, **kwargs)
         user.plain_password = cls.random_string(length=12)
         user.set_password(user.plain_password)
         user.save()
@@ -766,8 +766,9 @@ class DesecTestCase(MockPDNSTestCase):
 
     @classmethod
     def requests_desec_domain_creation(cls, name=None):
+        soa_content = 'get.desec.io. get.desec.io. 1 86400 86400 2419200 3600'
         return [
-            cls.request_pdns_zone_create(ns='LORD'),
+            cls.request_pdns_zone_create(ns='LORD', payload=soa_content),
             cls.request_pdns_zone_create(ns='MASTER'),
             cls.request_pdns_update_catalog(),
             cls.request_pdns_zone_axfr(name=name),
@@ -775,28 +776,26 @@ class DesecTestCase(MockPDNSTestCase):
         ]
 
     @classmethod
-    def requests_desec_domain_deletion(cls, name=None):
-        return [
-            cls.request_pdns_zone_delete(name=name, ns='LORD'),
-            cls.request_pdns_zone_delete(name=name, ns='MASTER'),
+    def requests_desec_domain_deletion(cls, domain):
+        requests = [
+            cls.request_pdns_zone_delete(name=domain.name, ns='LORD'),
+            cls.request_pdns_zone_delete(name=domain.name, ns='MASTER'),
             cls.request_pdns_update_catalog(),
         ]
+
+        if domain.is_locally_registrable:
+            delegate_at = cls._find_auto_delegation_zone(domain.name)
+            requests += [
+                cls.request_pdns_zone_update(name=delegate_at),
+                cls.request_pdns_zone_axfr(name=delegate_at),
+            ]
+
+        return requests
 
     @classmethod
     def requests_desec_domain_creation_auto_delegation(cls, name=None):
         delegate_at = cls._find_auto_delegation_zone(name)
         return cls.requests_desec_domain_creation(name=name) + [
-            cls.request_pdns_zone_update(name=delegate_at),
-            cls.request_pdns_zone_axfr(name=delegate_at),
-        ]
-
-    @classmethod
-    def requests_desec_domain_deletion_auto_delegation(cls, name=None):
-        delegate_at = cls._find_auto_delegation_zone(name)
-        return [
-            cls.request_pdns_zone_delete(name=name, ns='LORD'),
-            cls.request_pdns_zone_delete(name=name, ns='MASTER'),
-            cls.request_pdns_update_catalog(),
             cls.request_pdns_zone_update(name=delegate_at),
             cls.request_pdns_zone_axfr(name=delegate_at),
         ]
@@ -855,8 +854,14 @@ class DesecTestCase(MockPDNSTestCase):
     def assertContains(self, response, text, count=None, status_code=200, msg_prefix='', html=False):
         # convenience method to check the status separately, which yields nicer error messages
         self.assertStatus(response, status_code)
+        # same for the substring check
+        self.assertIn(text, response.content.decode(response.charset),
+                      f'Could not find {text} in the following response:\n{response.content.decode(response.charset)}')
         return super().assertContains(response, text, count, status_code, msg_prefix, html)
 
+    def assertAllSupportedRRSetTypes(self, types):
+        self.assertEqual(types, self.SUPPORTED_RR_SET_TYPES, 'Either some RR types given are unsupported, or not all '
+                                                             'supported RR types were in the given set.')
 
 class PublicSuffixMockMixin():
     def _mock_get_public_suffix(self, domain_name, public_suffixes=None):
@@ -943,7 +948,7 @@ class DomainOwnerTestCase(DesecTestCase, PublicSuffixMockMixin):
 
     def setUp(self):
         super().setUp()
-        self.client.credentials(HTTP_AUTHORIZATION='Token ' + self.token)
+        self.client.credentials(HTTP_AUTHORIZATION='Token ' + self.token.plain)
         self.setUpMockPatch()
 
 
@@ -979,21 +984,14 @@ class DynDomainOwnerTestCase(DomainOwnerTestCase):
     def setUp(self):
         super().setUp()
         self.client_token_authorized = self.client_class()
-        self.client.set_credentials_basic_auth(self.my_domain.name.lower(), self.token)
-        self.client_token_authorized.set_credentials_token_auth(self.token)
+        self.client.set_credentials_basic_auth(self.my_domain.name.lower(), self.token.plain)
+        self.client_token_authorized.set_credentials_token_auth(self.token.plain)
 
 
 class AuthenticatedRRSetBaseTestCase(DomainOwnerTestCase):
-    DEAD_TYPES = ['ALIAS', 'DNAME']
-    RESTRICTED_TYPES = ['SOA', 'RRSIG', 'DNSKEY', 'NSEC3PARAM', 'OPT']
-
-    # see https://doc.powerdns.com/md/types/
-    PDNS_RR_TYPES = ['A', 'AAAA', 'AFSDB', 'ALIAS', 'CAA', 'CERT', 'CDNSKEY', 'CDS', 'CNAME', 'DNSKEY', 'DNAME', 'DS',
-                     'HINFO', 'KEY', 'LOC', 'MX', 'NAPTR', 'NS', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'OPENPGPKEY', 'PTR',
-                     'RP', 'RRSIG', 'SOA', 'SPF', 'SSHFP', 'SRV', 'TKEY', 'TSIG', 'TLSA', 'SMIMEA', 'TXT', 'URI']
-    ALLOWED_TYPES = ['A', 'AAAA', 'AFSDB', 'CAA', 'CERT', 'CDNSKEY', 'CDS', 'CNAME', 'DS', 'HINFO', 'KEY', 'LOC', 'MX',
-                     'NAPTR', 'NS', 'NSEC', 'NSEC3', 'OPENPGPKEY', 'PTR', 'RP', 'SPF', 'SSHFP', 'SRV', 'TKEY', 'TSIG',
-                     'TLSA', 'SMIMEA', 'TXT', 'URI']
+    UNSUPPORTED_TYPES = RR_SET_TYPES_UNSUPPORTED
+    AUTOMATIC_TYPES = RR_SET_TYPES_AUTOMATIC
+    ALLOWED_TYPES = RR_SET_TYPES_MANAGEABLE
 
     SUBNAMES = ['foo', 'bar.baz', 'q.w.e.r.t', '*', '*.foobar', '_', '-foo.test', '_bar']
 

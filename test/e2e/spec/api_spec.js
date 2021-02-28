@@ -24,7 +24,7 @@ describe("API Versioning", function () {
         it("maintains the requested version " + version, function() {
             chakram.get('/' + version + '/').then(function (response) {
                 expect(response).to.have.schema(schemas.rootNoLogin);
-                let regex = new RegExp('http://[^/]+/api/' + version + '/auth/', 'g')
+                let regex = new RegExp('https://[^/]+/api/' + version + '/auth/login/', 'g')
                 expect(response.body.login).to.match(regex);
                 return chakram.wait();
             });
@@ -468,7 +468,7 @@ describe("API v1", function () {
                                 {'ttl': 3640, 'type': 'TXT', 'records': ['"bar"']},
                                 {'subname': 'c.1', 'records': ['dead::beef'], 'type': 'AAAA'},
                                 {'subname': 'd.1', 'ttl': 3650, 'type': 'AAAA'},
-                                {'subname': 'd.1', 'ttl': 3650, 'type': 'SOA', 'records': ['set.an.example. get.desec.io. 2018034419 10800 3600 604800 60']},
+                                {'subname': 'd.1', 'ttl': 3650, 'type': 'SOA', 'records': ['get.desec.io. get.desec.io. 2018034419 10800 3600 604800 60']},
                                 {'subname': 'd.1', 'ttl': 3650, 'type': 'OPT', 'records': ['9999']},
                                 {'subname': 'd.1', 'ttl': 3650, 'type': 'TYPE099', 'records': ['v=spf1 mx -all']},
                             ]
@@ -480,8 +480,8 @@ describe("API v1", function () {
                             { subname: [ 'This field is required.' ] },
                             { ttl: [ 'This field is required.' ] },
                             { records: [ 'This field is required.' ] },
-                            { type: [ 'You cannot tinker with the SOA RRset.' ] },
-                            { type: [ 'You cannot tinker with the OPT RRset.' ] },
+                            { type: [ 'You cannot tinker with the SOA RR set. It is managed automatically.' ] },
+                            { type: [ 'You cannot tinker with the OPT RR set. It is managed automatically.' ] },
                             { type: [ 'Generic type format is not supported.' ] },
                         ]);
 

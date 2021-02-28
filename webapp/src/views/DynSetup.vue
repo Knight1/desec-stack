@@ -147,7 +147,19 @@
               </p>
             </v-alert>
 
-            <h2 class="title">Keep deSEC Going</h2>
+            <div v-if="!$store.state.authenticated">
+              <h2 class="title">Optional: Assign deSEC Account Password</h2>
+              <p>
+                To use more features of deSEC, assign a password to your account. This is not required for using deSEC
+                for dynamic DNS only, but enables to you add more domains and other DNS information.
+                You can also assign a password later at any time.
+              </p>
+              <v-btn outlined block :to="{name: 'reset-password'}">
+                Assign Account Password
+              </v-btn>
+            </div>
+
+            <h2 class="title mt-4">Keep deSEC Going</h2>
             <p>
               To offer free DNS hosting for everyone, deSEC relies on donations only.
               If you like our service, please consider donating.
@@ -167,7 +179,6 @@
 
 <script>
   import axios from 'axios';
-  import {LOCAL_PUBLIC_SUFFIXES} from '../env';
 
   const HTTP = axios.create({
     baseURL: '/api/v1/',
@@ -183,7 +194,7 @@
       errors: [],
       ips: undefined,
       token: undefined,
-      LOCAL_PUBLIC_SUFFIXES: LOCAL_PUBLIC_SUFFIXES,
+      LOCAL_PUBLIC_SUFFIXES: process.env.VUE_APP_LOCAL_PUBLIC_SUFFIXES.split(' '),
       lastChanged: undefined,
     }),
     async mounted() {
@@ -242,7 +253,7 @@
             this.errors = error.response;
           } else {
             // 5xx
-            this.errors = ['Something went wrong at the server, but we currently do not know why. The customer support was already notified.'];
+            this.errors = ['Something went wrong at the server, but we currently do not know why. The support was already notified.'];
           }
         } else if (error.request) {
           this.errors = ['Cannot contact our servers. Are you offline?'];

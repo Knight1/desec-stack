@@ -13,7 +13,7 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
         super().setUpTestDataWithPdns()
 
         cls.data = [
-            {'subname': 'my-bulk', 'records': ['1.2.3.4'], 'ttl': 3600, 'type': 'A'},
+            {'subname': 'my-cname', 'records': ['example.com.'], 'ttl': 3600, 'type': 'CNAME'},
             {'subname': 'my-bulk', 'records': ['desec.io.', 'foobar.example.'], 'ttl': 3600, 'type': 'PTR'},
         ]
 
@@ -123,7 +123,7 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
                     {'subname': 'c.1', 'records': ['dead::beef'], 'type': 'AAAA'},
                     {'subname': 'd.1', 'ttl': 3650, 'type': 'AAAA'},
                     {'subname': 'd.1', 'ttl': 3650, 'type': 'SOA',
-                     'records': ['set.an.example. get.desec.io. 2018034419 10800 3600 604800 60']},
+                     'records': ['get.desec.io. get.desec.io. 2018034419 10800 3600 604800 60']},
                     {'subname': 'd.1', 'ttl': 3650, 'type': 'OPT', 'records': ['9999']},
                     {'subname': 'd.1', 'ttl': 3650, 'type': 'TYPE099', 'records': ['v=spf1 mx -all']},
                 ]
@@ -131,16 +131,30 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
             status.HTTP_400_BAD_REQUEST,
             [
                 {'type': ['This field is required.']},
-                {'ttl': [f'Ensure this value is greater than or equal to {settings.MINIMUM_TTL_DEFAULT}.']},
+                {'ttl': [f'Ensure this value is greater than or equal to {self.my_empty_domain.minimum_ttl}.']},
                 {'subname': ['This field is required.']},
                 {},
                 {'ttl': ['This field is required.']},
                 {'records': ['This field is required.']},
-                {'type': ['You cannot tinker with the SOA RRset.']},
-                {'type': ['You cannot tinker with the OPT RRset.']},
+                {'type': ['You cannot tinker with the SOA RR set. It is managed automatically.']},
+                {'type': ['You cannot tinker with the OPT RR set. It is managed automatically.']},
                 {'type': ['Generic type format is not supported.']},
             ]
         )
+
+    def test_bulk_patch_cname_exclusivity(self):
+        response = self.client.bulk_patch_rr_sets(
+            domain_name=self.my_rr_set_domain.name,
+            payload=[
+                {'subname': 'test', 'type': 'A', 'ttl': 3600, 'records': ['1.2.3.4']},
+                {'subname': 'test', 'type': 'CNAME', 'ttl': 3600, 'records': ['example.com.']},
+            ]
+        )
+        self.assertResponse(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json(), [
+            {"non_field_errors":["RRset with conflicting type present: 1 (CNAME). (No other RRsets are allowed alongside CNAME.)"]},
+            {"non_field_errors":["RRset with conflicting type present: 0 (A), database (A, TXT). (No other RRsets are allowed alongside CNAME.)"]},
+        ])
 
     def test_bulk_post_accepts_empty_list(self):
         self.assertResponse(
@@ -179,9 +193,43 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
         response = self.client.bulk_patch_rr_sets(domain_name=self.my_empty_domain.name, payload=[])
         self.assertStatus(response, status.HTTP_200_OK)
 
+        response = self.client.bulk_patch_rr_sets(domain_name=self.my_rr_set_domain.name, payload=[])
+        self.assertStatus(response, status.HTTP_200_OK)
+
     def test_bulk_patch_does_not_accept_empty_payload(self):
         response = self.client.bulk_patch_rr_sets(domain_name=self.my_empty_domain.name, payload=None)
         self.assertContains(response, 'No data provided', status_code=status.HTTP_400_BAD_REQUEST)
+
+    def test_bulk_patch_cname_exclusivity_atomic_rrset_replacement(self):
+        self.create_rr_set(self.my_empty_domain, subname='test', type='A', records=['1.2.3.4'], ttl=3600)
+
+        with self.assertPdnsRequests(self.requests_desec_rr_sets_update(self.my_empty_domain.name)):
+            response = self.client.bulk_patch_rr_sets(
+                domain_name=self.my_empty_domain.name,
+                payload=[
+                    {'subname': 'test', 'type': 'CNAME', 'ttl': 3605, 'records': ['example.com.']},
+                    {'subname': 'test', 'type': 'A', 'records': []},
+                ]
+            )
+            self.assertResponse(response, status.HTTP_200_OK)
+            self.assertEqual(len(response.data), 1)
+            self.assertEqual(response.data[0]['type'], 'CNAME')
+            self.assertEqual(response.data[0]['records'], ['example.com.'])
+            self.assertEqual(response.data[0]['ttl'], 3605)
+
+        with self.assertPdnsRequests(self.requests_desec_rr_sets_update(self.my_empty_domain.name)):
+            response = self.client.bulk_patch_rr_sets(
+                domain_name=self.my_empty_domain.name,
+                payload=[
+                    {'subname': 'test', 'type': 'CNAME', 'records': []},
+                    {'subname': 'test', 'type': 'A', 'ttl': 3600, 'records': ['5.4.2.1']},
+                ]
+            )
+            self.assertResponse(response, status.HTTP_200_OK)
+            self.assertEqual(len(response.data), 1)
+            self.assertEqual(response.data[0]['type'], 'A')
+            self.assertEqual(response.data[0]['records'], ['5.4.2.1'])
+            self.assertEqual(response.data[0]['ttl'], 3600)
 
     def test_bulk_patch_full_on_empty_domain(self):
         # Full patch always works
@@ -196,7 +244,7 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
 
     def test_bulk_patch_change_records(self):
         data_no_ttl = copy.deepcopy(self.data_no_ttl)
-        data_no_ttl[0]['records'] = ['4.3.2.1', '8.8.1.2']
+        data_no_ttl[0]['records'] = ['example.org.']
         with self.assertPdnsRequests(self.requests_desec_rr_sets_update(name=self.bulk_domain.name)):
             response = self.client.bulk_patch_rr_sets(domain_name=self.bulk_domain.name, payload=data_no_ttl)
             self.assertStatus(response, status.HTTP_200_OK)
@@ -327,6 +375,8 @@ class AuthenticatedRRSetBulkTestCase(AuthenticatedRRSetBaseTestCase):
 
     def test_bulk_put_does_accept_empty_list(self):
         response = self.client.bulk_put_rr_sets(domain_name=self.my_empty_domain.name, payload=[])
+        self.assertStatus(response, status.HTTP_200_OK)
+        response = self.client.bulk_put_rr_sets(domain_name=self.my_rr_set_domain.name, payload=[])
         self.assertStatus(response, status.HTTP_200_OK)
 
     def test_bulk_put_does_not_accept_empty_payload(self):

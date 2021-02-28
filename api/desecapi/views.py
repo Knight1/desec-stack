@@ -1,5 +1,7 @@
 import base64
 import binascii
+from datetime import timedelta
+from functools import cached_property
 
 from django.conf import settings
 from django.contrib.auth import user_logged_in
@@ -9,9 +11,7 @@ from django.core.mail import EmailMessage
 from django.http import Http404
 from django.shortcuts import redirect
 from django.template.loader import get_template
-from rest_framework import generics
-from rest_framework import mixins
-from rest_framework import status
+from rest_framework import generics, mixins, status, viewsets
 from rest_framework.authentication import get_authorization_header
 from rest_framework.exceptions import (NotAcceptable, NotFound, PermissionDenied, ValidationError)
 from rest_framework.permissions import IsAuthenticated, SAFE_METHODS
@@ -19,15 +19,21 @@ from rest_framework.renderers import JSONRenderer, StaticHTMLRenderer
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
 from rest_framework.views import APIView
-from rest_framework.viewsets import GenericViewSet
 
 import desecapi.authentication as auth
 from desecapi import metrics, models, serializers
 from desecapi.exceptions import ConcurrencyException
 from desecapi.pdns import get_serials
 from desecapi.pdns_change_tracker import PDNSChangeTracker
-from desecapi.permissions import IsDomainOwner, IsOwner, IsVPNClient, WithinDomainLimitOnPOST
+from desecapi.permissions import ManageTokensPermission, IsDomainOwner, IsOwner, IsVPNClient, WithinDomainLimitOnPOST
 from desecapi.renderers import PlainTextRenderer
+
+
+def generate_confirmation_link(request, action_serializer, viewname, **kwargs):
+    action = action_serializer.Meta.model(**kwargs)
+    action_data = action_serializer(action).data
+    confirmation_link = reverse(viewname, request=request, args=[action_data['code']])
+    return confirmation_link, action_serializer.validity_period
 
 
 class EmptyPayloadMixin:
@@ -61,6 +67,9 @@ class IdempotentDestroyMixin:
 
 class DomainViewMixin:
 
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), 'domain': self.domain}
+
     def initial(self, request, *args, **kwargs):
         # noinspection PyUnresolvedReferences
         super().initial(request, *args, **kwargs)
@@ -71,14 +80,9 @@ class DomainViewMixin:
             raise Http404
 
 
-class TokenViewSet(IdempotentDestroyMixin,
-                   mixins.CreateModelMixin,
-                   mixins.RetrieveModelMixin,
-                   mixins.DestroyModelMixin,
-                   mixins.ListModelMixin,
-                   GenericViewSet):
+class TokenViewSet(IdempotentDestroyMixin, viewsets.ModelViewSet):
     serializer_class = serializers.TokenSerializer
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsAuthenticated, ManageTokensPermission,)
     throttle_scope = 'account_management_passive'
 
     def get_queryset(self):
@@ -99,7 +103,7 @@ class DomainViewSet(IdempotentDestroyMixin,
                     mixins.RetrieveModelMixin,
                     mixins.DestroyModelMixin,
                     mixins.ListModelMixin,
-                    GenericViewSet):
+                    viewsets.GenericViewSet):
     serializer_class = serializers.DomainSerializer
     permission_classes = (IsAuthenticated, IsOwner, WithinDomainLimitOnPOST)
     lookup_field = 'name'
@@ -173,9 +177,6 @@ class RRsetDetail(IdempotentDestroyMixin, DomainViewMixin, generics.RetrieveUpda
 
         return obj
 
-    def get_serializer(self, *args, **kwargs):
-        return super().get_serializer(domain=self.domain, *args, **kwargs)
-
     def update(self, request, *args, **kwargs):
         response = super().update(request, *args, **kwargs)
 
@@ -208,7 +209,7 @@ class RRsetList(EmptyPayloadMixin, DomainViewMixin, generics.ListCreateAPIView, 
 
             if value is not None:
                 # TODO consider moving this
-                if filter_field == 'type' and value in models.RRset.RESTRICTED_TYPES:
+                if filter_field == 'type' and value in models.RR_SET_TYPES_AUTOMATIC:
                     raise PermissionDenied("You cannot tinker with the %s RRset." % value)
 
                 rrsets = rrsets.filter(**{'%s__exact' % filter_field: value})
@@ -231,15 +232,15 @@ class RRsetList(EmptyPayloadMixin, DomainViewMixin, generics.ListCreateAPIView, 
             elif self.request.method in ['PATCH', 'PUT']:
                 kwargs['many'] = True
 
-        return super().get_serializer(domain=self.domain, *args, **kwargs)
+        return super().get_serializer(*args, **kwargs)
 
     def perform_create(self, serializer):
         with PDNSChangeTracker():
-            serializer.save(domain=self.domain)
+            super().perform_create(serializer)
 
     def perform_update(self, serializer):
         with PDNSChangeTracker():
-            serializer.save(domain=self.domain)
+            super().perform_update(serializer)
 
 
 class Root(APIView):
@@ -265,60 +266,12 @@ class Root(APIView):
         return Response(routes)
 
 
-class DynDNS12Update(APIView):
+class DynDNS12Update(generics.GenericAPIView):
     authentication_classes = (auth.TokenAuthentication, auth.BasicTokenAuthentication, auth.URLParamAuthentication,)
     renderer_classes = [PlainTextRenderer]
     throttle_scope = 'dyndns'
 
-    def _find_domain(self, request):
-        def find_domain_name(r):
-            # 1. hostname parameter
-            if 'hostname' in r.query_params and r.query_params['hostname'] != 'YES':
-                return r.query_params['hostname']
-
-            # 2. host_id parameter
-            if 'host_id' in r.query_params:
-                return r.query_params['host_id']
-
-            # 3. http basic auth username
-            try:
-                domain_name = base64.b64decode(
-                    get_authorization_header(r).decode().split(' ')[1].encode()).decode().split(':')[0]
-                if domain_name and '@' not in domain_name:
-                    return domain_name
-            except IndexError:
-                pass
-            except UnicodeDecodeError:
-                pass
-            except binascii.Error:
-                pass
-
-            # 4. username parameter
-            if 'username' in r.query_params:
-                return r.query_params['username']
-
-            # 5. only domain associated with this user account
-            if len(r.user.domains.all()) == 1:
-                return r.user.domains.all()[0].name
-            if len(r.user.domains.all()) > 1:
-                ex = ValidationError(detail={
-                    "detail": "Request does not specify domain unambiguously.",
-                    "code": "domain-ambiguous"
-                })
-                ex.status_code = status.HTTP_409_CONFLICT
-                raise ex
-
-            return None
-
-        name = find_domain_name(request).lower()
-
-        try:
-            return self.request.user.domains.get(name=name)
-        except models.Domain.DoesNotExist:
-            return None
-
-    @staticmethod
-    def find_ip(request, params, version=4):
+    def _find_ip(self, params, version):
         if version == 4:
             look_for = '.'
         elif version == 6:
@@ -328,49 +281,92 @@ class DynDNS12Update(APIView):
 
         # Check URL parameters
         for p in params:
-            if p in request.query_params:
-                if not len(request.query_params[p]):
+            if p in self.request.query_params:
+                if not len(self.request.query_params[p]):
                     return None
-                if look_for in request.query_params[p]:
-                    return request.query_params[p]
+                if look_for in self.request.query_params[p]:
+                    return self.request.query_params[p]
 
         # Check remote IP address
-        client_ip = request.META.get('REMOTE_ADDR')
+        client_ip = self.request.META.get('REMOTE_ADDR')
         if look_for in client_ip:
             return client_ip
 
         # give up
         return None
 
-    def _find_ip_v4(self, request):
-        return self.find_ip(request, ['myip', 'myipv4', 'ip'])
+    @cached_property
+    def qname(self):
+        # hostname parameter
+        try:
+            if self.request.query_params['hostname'] != 'YES':
+                return self.request.query_params['hostname'].lower()
+        except KeyError:
+            pass
 
-    def _find_ip_v6(self, request):
-        return self.find_ip(request, ['myipv6', 'ipv6', 'myip', 'ip'], version=6)
+        # host_id parameter
+        try:
+            return self.request.query_params['host_id'].lower()
+        except KeyError:
+            pass
 
-    def get(self, request, *_):
-        domain = self._find_domain(request)
+        # http basic auth username
+        try:
+            domain_name = base64.b64decode(
+                get_authorization_header(self.request).decode().split(' ')[1].encode()).decode().split(':')[0]
+            if domain_name and '@' not in domain_name:
+                return domain_name.lower()
+        except (binascii.Error, IndexError, UnicodeDecodeError):
+            pass
 
-        if domain is None:
+        # username parameter
+        try:
+            return self.request.query_params['username'].lower()
+        except KeyError:
+            pass
+
+        # only domain associated with this user account
+        try:
+            return self.request.user.domains.get().name
+        except models.Domain.MultipleObjectsReturned:
+            raise ValidationError(detail={
+                "detail": "Request does not properly specify domain for update.",
+                "code": "domain-unspecified"
+            })
+        except models.Domain.DoesNotExist:
             metrics.get('desecapi_dynDNS12_domain_not_found').inc()
             raise NotFound('nohost')
 
-        ipv4 = self._find_ip_v4(request)
-        ipv6 = self._find_ip_v6(request)
+    @cached_property
+    def domain(self):
+        try:
+            return models.Domain.objects.filter_qname(self.qname, owner=self.request.user).order_by('-name_length')[0]
+        except (IndexError, ValueError):
+            raise NotFound('nohost')
+
+    @property
+    def subname(self):
+        return self.qname.rpartition(f'.{self.domain.name}')[0]
+
+    def get_queryset(self):
+        return self.domain.rrset_set.filter(subname=self.subname, type__in=['A', 'AAAA'])
+
+    def get(self, request, *_):
+        instances = self.get_queryset().all()
+
+        ipv4 = self._find_ip(['myip', 'myipv4', 'ip'], version=4)
+        ipv6 = self._find_ip(['myipv6', 'ipv6', 'myip', 'ip'], version=6)
 
         data = [
-            {'type': 'A', 'subname': '', 'ttl': 60, 'records': [ipv4] if ipv4 else []},
-            {'type': 'AAAA', 'subname': '', 'ttl': 60, 'records': [ipv6] if ipv6 else []},
+            {'type': 'A', 'subname': self.subname, 'ttl': 60, 'records': [ipv4] if ipv4 else []},
+            {'type': 'AAAA', 'subname': self.subname, 'ttl': 60, 'records': [ipv6] if ipv6 else []},
         ]
 
-        instances = domain.rrset_set.filter(subname='', type__in=['A', 'AAAA']).all()
-        serializer = serializers.RRsetSerializer(instances, domain=domain, data=data, many=True, partial=True)
+        context = {'domain': self.domain, 'minimum_ttl': 60}
+        serializer = serializers.RRsetSerializer(instances, data=data, many=True, partial=True, context=context)
         try:
             serializer.is_valid(raise_exception=True)
         except ValidationError as e:
-            if any('ttl' in error for error in e.detail):
-                raise PermissionDenied({'detail': 'Domain not eligible for dynamic updates, please contact support.'})
-
             if any(
                     any(
                         getattr(non_field_error, 'code', '') == 'unique'
@@ -383,9 +379,9 @@ class DynDNS12Update(APIView):
             raise e
 
         with PDNSChangeTracker():
-            serializer.save(domain=domain)
+            serializer.save()
 
-        return Response('good', content_type='text/plain')
+        return Response('good')
 
 
 class DonationList(generics.CreateAPIView):
@@ -455,10 +451,12 @@ class AccountCreateView(generics.CreateAPIView):
             # send email if needed
             domain = serializer.validated_data.get('domain')
             if domain or activation_required:
-                action = models.AuthenticatedActivateUserAction(user=user, domain=domain)
-                verification_code = serializers.AuthenticatedActivateUserActionSerializer(action).data['code']
+                link, validity_period = generate_confirmation_link(request,
+                                                                   serializers.AuthenticatedActivateUserActionSerializer,
+                                                                   'confirm-activate-account', user=user, domain=domain)
                 user.send_email('activate-with-domain' if domain else 'activate', context={
-                    'confirmation_link': reverse('confirm-activate-account', request=request, args=[verification_code]),
+                    'confirmation_link': link,
+                    'link_expiration_hours': validity_period // timedelta(hours=1),
                     'domain': domain,
                 })
 
@@ -488,10 +486,12 @@ class AccountDeleteView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         if self.request.user.domains.exists():
             return self.response_still_has_domains
-        action = models.AuthenticatedDeleteUserAction(user=self.request.user)
-        verification_code = serializers.AuthenticatedDeleteUserActionSerializer(action).data['code']
+        link, validity_period = generate_confirmation_link(request,
+                                                           serializers.AuthenticatedDeleteUserActionSerializer,
+                                                           'confirm-delete-account', user=self.request.user)
         request.user.send_email('delete-user', context={
-            'confirmation_link': reverse('confirm-delete-account', request=request, args=[verification_code])
+            'confirmation_link': link,
+            'link_expiration_hours': validity_period // timedelta(hours=1),
         })
 
         return Response(data={'detail': 'Please check your mailbox for further account deletion instructions.'},
@@ -506,7 +506,8 @@ class AccountLoginView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         user = self.request.user
 
-        token = models.Token.objects.create(user=user, name="login")
+        token = models.Token.objects.create(user=user, name="login", perm_manage_tokens=True,
+                                            max_age=timedelta(days=7), max_unused_period=timedelta(hours=1))
         user_logged_in.send(sender=user.__class__, request=self.request, user=user)
 
         data = serializers.TokenSerializer(token, include_plain=True).data
@@ -538,10 +539,12 @@ class AccountChangeEmailView(generics.GenericAPIView):
         serializer.is_valid(raise_exception=True)
         new_email = serializer.validated_data['new_email']
 
-        action = models.AuthenticatedChangeEmailUserAction(user=request.user, new_email=new_email)
-        verification_code = serializers.AuthenticatedChangeEmailUserActionSerializer(action).data['code']
+        link, validity_period = generate_confirmation_link(request,
+                                                           serializers.AuthenticatedChangeEmailUserActionSerializer,
+                                                           'confirm-change-email', user=request.user, new_email=new_email)
         request.user.send_email('change-email', recipient=new_email, context={
-            'confirmation_link': reverse('confirm-change-email', request=request, args=[verification_code]),
+            'confirmation_link': link,
+            'link_expiration_hours': validity_period // timedelta(hours=1),
             'old_email': request.user.email,
             'new_email': new_email,
         })
@@ -573,10 +576,12 @@ class AccountResetPasswordView(generics.GenericAPIView):
 
     @staticmethod
     def send_reset_token(user, request):
-        action = models.AuthenticatedResetPasswordUserAction(user=user)
-        verification_code = serializers.AuthenticatedResetPasswordUserActionSerializer(action).data['code']
+        link, validity_period = generate_confirmation_link(request,
+                                                           serializers.AuthenticatedResetPasswordUserActionSerializer,
+                                                           'confirm-reset-password', user=user)
         user.send_email('reset-password', context={
-            'confirmation_link': reverse('confirm-reset-password', request=request, args=[verification_code])
+            'confirmation_link': link,
+            'link_expiration_hours': validity_period // timedelta(hours=1),
         })
 
 
@@ -584,24 +589,33 @@ class AuthenticatedActionView(generics.GenericAPIView):
     """
     Abstract class. Deserializes the given payload according the serializers specified by the view extending
     this class. If the `serializer.is_valid`, `act` is called on the action object.
+
+    Summary of the behavior depending on HTTP method and Accept: header:
+
+                        GET	                                POST                other method
+    Accept: text/html	forward to `self.html_url` if any   perform action      405 Method Not Allowed
+    else                HTTP 406 Not Acceptable             perform action      405 Method Not Allowed
     """
     action = None
-    authentication_classes = (auth.AuthenticatedActionAuthentication,)
-    html_url = None
+    html_url = None  # Redirect GET requests to this webapp GUI URL
     http_method_names = ['get', 'post']  # GET is for redirect only
     renderer_classes = [JSONRenderer, StaticHTMLRenderer]
+
+    @property
+    def authentication_classes(self):
+        # This prevents both code evaluation and user-specific throttling when we only want a redirect
+        return () if self.request.method in SAFE_METHODS else (auth.AuthenticatedBasicUserActionAuthentication,)
 
     @property
     def throttle_scope(self):
         return 'account_management_passive' if self.request.method in SAFE_METHODS else 'account_management_active'
 
     def get_serializer_context(self):
-        return {**super().get_serializer_context(), 'code': self.kwargs['code']}
-
-    def perform_authentication(self, request):
-        # Delay authentication until request.auth or request.user is first accessed.
-        # This allows returning a redirect or status 405 without validating the action code.
-        pass
+        return {
+            **super().get_serializer_context(),
+            'code': self.kwargs['code'],
+            'validity_period': self.get_serializer_class().validity_period,
+        }
 
     def get(self, request, *args, **kwargs):
         # Redirect browsers to frontend if available
@@ -620,7 +634,10 @@ class AuthenticatedActionView(generics.GenericAPIView):
         try:
             self.action = serializer.Meta.model(**serializer.validated_data)
         except ValueError:  # this happens when state cannot be verified
-            raise ValidationError('Invalid code.')
+            ex = ValidationError('This action cannot be carried out because another operation has been performed, '
+                                 'invalidating this one. (Are you trying to perform this action twice?)')
+            ex.status_code = status.HTTP_409_CONFLICT
+            raise ex
 
         self.action.act()
         return self.finalize()
@@ -717,6 +734,14 @@ class AuthenticatedDeleteUserActionView(AuthenticatedActionView):
 
     def finalize(self):
         return Response({'detail': 'All your data has been deleted. Bye bye, see you soon! <3'})
+
+
+class AuthenticatedRenewDomainBasicUserActionView(AuthenticatedActionView):
+    html_url = '/confirm/renew-domain/{code}/'
+    serializer_class = serializers.AuthenticatedRenewDomainBasicUserActionSerializer
+
+    def finalize(self):
+        return Response({'detail': f'We recorded that your domain {self.action.domain} is still in use.'})
 
 
 class CaptchaView(generics.CreateAPIView):

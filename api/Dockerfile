@@ -1,27 +1,32 @@
-FROM python:3.8-buster
+FROM python:3.9-alpine
 
-RUN apt-get update && apt-get install -y \
-		gcc \
-		gettext \
-		default-mysql-client default-libmysqlclient-dev \
-		libmemcached-dev \
-		postgresql-client libpq-dev \
-		sqlite3 \
-		cron \
-	--no-install-recommends && apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY --from=trajano/alpine-libfaketime /faketime.so /lib/libfaketime.so
+RUN mkdir -p /etc/faketime
+
+RUN apk add --no-cache bash dcron postgresql-client sqlite
 
 RUN mkdir /usr/src/app
 WORKDIR /usr/src/app
 
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
+
 COPY requirements.txt /usr/src/app/
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install -r requirements.txt && rm -rf /root/.cache/
+RUN apk add --no-cache gcc freetype-dev libffi-dev musl-dev libmemcached-dev postgresql-dev jpeg-dev zlib-dev git \
+    && pip install -r requirements.txt \
+    && apk --no-cache del gcc
+RUN pip freeze
 
 RUN mkdir /root/cronhook
 ADD ["cronhook/crontab", "cronhook/start-cron.sh", "/root/cronhook/"]
 
 RUN crontab /root/cronhook/crontab
 RUN chmod +x /root/cronhook/start-cron.sh
+
+RUN mkdir /zones /var/run/celerybeat-schedule \
+    && chown nobody /zones /var/run/celerybeat-schedule \
+    && chmod 755 /zones \
+    && chmod 700 /var/run/celerybeat-schedule
 
 COPY . /usr/src/app
 

@@ -77,21 +77,33 @@
                                             class="uppercase"
                                             ref="captchaField"
                                             tabindex="3"
+                                            :hint="captcha_kind === 'image' ? 'Can\'t see? Hear an audio CAPTCHA instead.' : 'Trouble hearing? Switch to an image CAPTCHA.'"
                                     />
                                   </v-col>
-                                  <v-col cols="8" sm="auto">
+                                  <v-col cols="12" sm="auto">
                                     <v-progress-circular
-                                            indeterminate
-                                            v-if="captchaWorking"
+                                          indeterminate
+                                          v-if="captchaWorking"
                                     ></v-progress-circular>
                                     <img
-                                            v-if="captcha && !captchaWorking"
-                                            :src="'data:image/png;base64,'+captcha.challenge"
-                                            alt="Passwords can also be reset by sending an email to our support."
+                                          v-if="captcha && !captchaWorking && captcha_kind === 'image'"
+                                          :src="'data:image/png;base64,'+captcha.challenge"
+                                          alt="Passwords can also be reset by sending an email to our support."
+                                    />
+                                    <audio controls
+                                          v-if="captcha && !captchaWorking && captcha_kind === 'audio'"
                                     >
-                                  </v-col>
-                                  <v-col cols="4" sm="auto">
-                                    <v-btn text outlined @click="getCaptcha(true)" :disabled="captchaWorking"><v-icon>mdi-refresh</v-icon></v-btn>
+                                      <source :src="'data:audio/wav;base64,'+captcha.challenge" type="audio/wav"/>
+                                    </audio>
+                                    <br/>
+                                    <v-btn-toggle>
+                                      <v-btn text outlined @click="getCaptcha(true)" :disabled="captchaWorking"><v-icon>mdi-refresh</v-icon></v-btn>
+                                    </v-btn-toggle>
+                                    &nbsp;
+                                    <v-btn-toggle v-model="captcha_kind">
+                                      <v-btn text outlined value="image" aria-label="Switch to Image CAPTCHA" :disabled="captchaWorking"><v-icon>mdi-eye</v-icon></v-btn>
+                                      <v-btn text outlined value="audio" aria-label="Switch to Audio CAPTCHA" :disabled="captchaWorking"><v-icon>mdi-ear-hearing</v-icon></v-btn>
+                                    </v-btn-toggle>
                                   </v-col>
                                 </v-row>
                               </v-container>
@@ -124,7 +136,7 @@
   });
 
   export default {
-    name: 'SignUp',
+    name: 'ResetPassword',
     data: () => ({
       valid: false,
       working: false,
@@ -142,6 +154,7 @@
       captchaSolution: '',
       captcha_rules: [v => !!v || 'Please enter the text displayed in the picture so we are (somewhat) convinced you are human'],
       captcha_errors: [],
+      captcha_kind: 'image',
     }),
     async mounted() {
       if ('email' in this.$route.params && this.$route.params.email !== undefined) {
@@ -155,7 +168,7 @@
         this.captchaWorking = true;
         this.captchaSolution = "";
         try {
-          this.captcha = (await HTTP.post('captcha/')).data;
+          this.captcha = (await HTTP.post('captcha/', {kind: this.captcha_kind})).data;
           if(focus) {
             this.$refs.captchaField.focus()
           }
@@ -174,7 +187,7 @@
         this.errors = [];
         try {
           await HTTP.post('auth/account/reset-password/', {
-            email: this.email.toLowerCase(),
+            email: this.email,
             captcha: {
               id: this.captcha.id,
               solution: this.captchaSolution,
@@ -203,7 +216,7 @@
               }
             } else {
               // 5xx
-              this.errors = ['Something went wrong at the server, but we currently do not know why. The customer support was already notified.'];
+              this.errors = ['Something went wrong at the server, but we currently do not know why. The support was already notified.'];
             }
           } else if (error.request) {
             this.errors = ['Cannot contact our servers. Are you offline?'];
@@ -212,6 +225,13 @@
           }
         }
         this.working = false;
+      },
+    },
+    watch: {
+      captcha_kind: function (oldKind, newKind) {
+        if (oldKind !== newKind) {
+          this.getCaptcha();
+        }
       },
     },
   };

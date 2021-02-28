@@ -50,10 +50,16 @@ services:
       driver: "json-file"
 
   rabbitmq:
+    ports:
+    - "15672:15672"
     logging:
       driver: "json-file"
 
-  celery:
+  celery-email:
+    logging:
+      driver: "json-file"
+
+  celery-replication:
     logging:
       driver: "json-file"
 
@@ -65,11 +71,8 @@ services:
     volumes:
     - ./webapp/:/usr/src/app/
     working_dir: /usr/src/app/
-    command: bash -c "cat src/env.js.template | envsubst > src/env.js && npm run serve --fix"
+    command: "npm run serve --fix"
     environment:
-    - DESECSTACK_DOMAIN
-    - DESECSTACK_API_SEPA_CREDITOR_ID
-    - DESECSTACK_API_SEPA_CREDITOR_NAME
     - HOST=0.0.0.0
     - PORT=443
     networks:
